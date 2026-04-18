@@ -52,15 +52,26 @@ pub enum PollEvent {
 /// Commands the main loop sends to a worker.
 #[derive(Debug, Clone, Copy)]
 pub enum WorkerCmd {
-    /// Wake up and re-poll immediately (then resume normal cadence).
+    /// Wake up and re-poll immediately; also clears the paused flag so
+    /// normal cadence resumes.
     Refresh,
+    /// Stop re-polling until a `Refresh` (or `Quit`) arrives. Workers that
+    /// returned an unrecoverable error (auth missing, provider not
+    /// supported on this platform, …) get paused so they stop re-spawning
+    /// `codexbar` subprocesses — critical for Codex, whose CLI opens a
+    /// browser tab every time it's invoked without `~/.codex/auth.json`.
+    Pause,
     /// Exit the worker thread.
     Quit,
 }
 
 /// Handle on a running worker. Dropping it does not kill the worker; send
-/// `WorkerCmd::Quit` for a clean exit.
+/// `WorkerCmd::Quit` for a clean exit. The `provider` + `command` fields
+/// let callers target a single worker (e.g. to pause it after an auth
+/// failure) rather than broadcasting.
 pub struct WorkerHandle {
+    pub provider: ProviderId,
+    pub command: Command,
     pub tx: Sender<WorkerCmd>,
     pub join: thread::JoinHandle<()>,
 }
@@ -104,6 +115,20 @@ pub fn broadcast_refresh(handles: &[WorkerHandle]) {
     }
 }
 
+/// Pause a single worker identified by `(provider, command)`. Used when
+/// the main loop classifies a poll result as unrecoverable (AuthMissing
+/// etc.) so we don't keep hammering a provider that can't possibly
+/// succeed. Best-effort on send. Safe to call repeatedly — a second Pause
+/// to an already-paused worker is a no-op.
+pub fn pause_worker(handles: &[WorkerHandle], provider: &ProviderId, command: Command) {
+    for h in handles {
+        if &h.provider == provider && h.command == command {
+            let _ = h.tx.send(WorkerCmd::Pause);
+            return;
+        }
+    }
+}
+
 /// Tell every worker to quit and wait for them. Best-effort on send.
 pub fn shutdown(handles: Vec<WorkerHandle>) {
     for h in &handles {
@@ -121,11 +146,17 @@ fn spawn_worker(
     ev_tx: Sender<PollEvent>,
 ) -> WorkerHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCmd>();
+    let provider_for_thread = provider.clone();
     let join = thread::Builder::new()
         .name(format!("poll-{:?}-{:?}", provider, command))
-        .spawn(move || worker_loop(provider, command, interval, ev_tx, cmd_rx))
+        .spawn(move || worker_loop(provider_for_thread, command, interval, ev_tx, cmd_rx))
         .expect("spawn worker thread");
-    WorkerHandle { tx: cmd_tx, join }
+    WorkerHandle {
+        provider,
+        command,
+        tx: cmd_tx,
+        join,
+    }
 }
 
 fn worker_loop(
@@ -135,12 +166,30 @@ fn worker_loop(
     ev_tx: Sender<PollEvent>,
     cmd_rx: Receiver<WorkerCmd>,
 ) {
+    let mut paused = false;
     loop {
-        run_once(&provider, command, &ev_tx);
+        if !paused {
+            run_once(&provider, command, &ev_tx);
+        }
 
-        // Wait for the next tick, but listen for manual refresh / quit.
-        match cmd_rx.recv_timeout(interval) {
-            Ok(WorkerCmd::Refresh) => continue, // loop around and re-poll now
+        // When paused we wait indefinitely for a control message (don't
+        // burn cycles waking every `interval` seconds just to re-sleep).
+        // When active we wait up to `interval` then re-poll on timeout.
+        let result = if paused {
+            cmd_rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            cmd_rx.recv_timeout(interval)
+        };
+
+        match result {
+            Ok(WorkerCmd::Refresh) => {
+                paused = false;
+                continue; // re-poll immediately at the top of the loop
+            }
+            Ok(WorkerCmd::Pause) => {
+                paused = true;
+                continue; // next iteration skips run_once
+            }
             Ok(WorkerCmd::Quit) => return,
             Err(RecvTimeoutError::Timeout) => continue, // normal cadence
             Err(RecvTimeoutError::Disconnected) => return, // main dropped its sender
@@ -215,18 +264,29 @@ mod tests {
     //! refresh-broadcast round trip.
     use super::*;
 
+    fn fake_handle(
+        provider: &str,
+        command: Command,
+        logic: impl FnOnce(Receiver<WorkerCmd>) + Send + 'static,
+    ) -> WorkerHandle {
+        let (tx, rx) = mpsc::channel::<WorkerCmd>();
+        let join = thread::spawn(move || logic(rx));
+        WorkerHandle {
+            provider: ProviderId::new(provider),
+            command,
+            tx,
+            join,
+        }
+    }
+
     #[test]
     fn broadcast_refresh_delivers_to_every_worker() {
-        // Build a pair of pseudo-workers: each is a thread that receives
-        // a single message and shuts down. We only exercise the tx side.
         let mut handles = Vec::new();
         for _ in 0..3 {
-            let (tx, rx) = mpsc::channel::<WorkerCmd>();
-            let join = thread::spawn(move || match rx.recv() {
+            handles.push(fake_handle("x", Command::Usage, |rx| match rx.recv() {
                 Ok(WorkerCmd::Refresh) => {}
                 other => panic!("expected Refresh, got {other:?}"),
-            });
-            handles.push(WorkerHandle { tx, join });
+            }));
         }
         broadcast_refresh(&handles);
         for h in handles {
@@ -238,17 +298,61 @@ mod tests {
     fn shutdown_quits_each_worker() {
         let mut handles = Vec::new();
         for _ in 0..2 {
-            let (tx, rx) = mpsc::channel::<WorkerCmd>();
-            let join = thread::spawn(move || loop {
+            handles.push(fake_handle("x", Command::Usage, |rx| loop {
                 match rx.recv() {
                     Ok(WorkerCmd::Quit) => return,
-                    Ok(WorkerCmd::Refresh) => continue,
+                    Ok(WorkerCmd::Refresh | WorkerCmd::Pause) => continue,
                     Err(_) => return,
                 }
-            });
-            handles.push(WorkerHandle { tx, join });
+            }));
         }
         shutdown(handles);
+    }
+
+    #[test]
+    fn pause_worker_targets_the_matching_handle() {
+        // Three workers: (claude, usage), (claude, cost), (codex, usage).
+        // Pausing (codex, usage) must wake ONLY that thread and leave the
+        // other two still blocked on their receiver.
+        use std::sync::{Arc, Mutex};
+        let received: Arc<Mutex<Vec<(String, Command)>>> = Arc::new(Mutex::new(Vec::new()));
+
+        fn watcher(
+            label: (String, Command),
+            bag: Arc<Mutex<Vec<(String, Command)>>>,
+        ) -> impl FnOnce(Receiver<WorkerCmd>) + Send + 'static {
+            move |rx: Receiver<WorkerCmd>| match rx.recv() {
+                Ok(WorkerCmd::Pause) => bag.lock().unwrap().push(label),
+                Ok(other) => panic!("expected Pause, got {other:?}"),
+                Err(_) => {}
+            }
+        }
+
+        let h1 = fake_handle(
+            "claude",
+            Command::Usage,
+            watcher(("claude".into(), Command::Usage), received.clone()),
+        );
+        let h2 = fake_handle(
+            "claude",
+            Command::Cost,
+            watcher(("claude".into(), Command::Cost), received.clone()),
+        );
+        let h3 = fake_handle(
+            "codex",
+            Command::Usage,
+            watcher(("codex".into(), Command::Usage), received.clone()),
+        );
+
+        pause_worker(&[h1, h2, h3][..], &ProviderId::new("codex"), Command::Usage);
+
+        // Give the targeted worker a beat to wake, record, and exit.
+        // Then close the other two by dropping their handles (which drops
+        // their Sender, causing the `rx.recv()` to Err and the thread to
+        // return cleanly so the test doesn't leak threads).
+        thread::sleep(Duration::from_millis(50));
+        let got = received.lock().unwrap().clone();
+        assert_eq!(got, vec![("codex".to_string(), Command::Usage)]);
     }
 
     #[test]

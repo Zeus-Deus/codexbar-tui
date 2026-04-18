@@ -20,9 +20,11 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::config::Config;
-use crate::merge::{ProviderId, build_snapshot};
+use crate::merge::{ProviderHealth, ProviderId, build_snapshot};
 use crate::parse::{CostRecord, UsageRecord};
-use crate::poll::{PollEvent, WorkerHandle, broadcast_refresh, shutdown, start_workers};
+use crate::poll::{
+    PollEvent, WorkerHandle, broadcast_refresh, pause_worker, shutdown, start_workers,
+};
 use crate::state::{AppState, Command};
 
 const RENDER_TICK: Duration = Duration::from_millis(1000);
@@ -239,7 +241,7 @@ fn run_event_loop(
         // Drain any poll events accumulated since the last tick.
         loop {
             match rx.try_recv() {
-                Ok(ev) => apply_event(ev, state, &mut caches),
+                Ok(ev) => apply_event(ev, state, &mut caches, handles),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // All workers exited — keep running so the user can see
@@ -293,16 +295,19 @@ fn apply_event(
     ev: PollEvent,
     state: &mut AppState,
     caches: &mut std::collections::HashMap<ProviderId, ProviderCache>,
+    handles: &[WorkerHandle],
 ) {
     match ev {
         PollEvent::Usage { provider, records } => {
             caches.entry(provider.clone()).or_default().usage = Some(records);
             rebuild(&provider, state, caches);
+            maybe_pause_after(&provider, Command::Usage, state, handles);
             state.clear_status();
         }
         PollEvent::Cost { provider, record } => {
             caches.entry(provider.clone()).or_default().cost = record;
             rebuild(&provider, state, caches);
+            maybe_pause_after(&provider, Command::Cost, state, handles);
             state.clear_status();
         }
         PollEvent::Error {
@@ -316,6 +321,35 @@ fn apply_event(
             };
             state.set_status(format!("{} {}: {message}", provider.label(), which));
         }
+    }
+}
+
+/// Pause a worker after a classify-as-unrecoverable result so we stop
+/// re-spawning codexbar for a provider that can't succeed without user
+/// action. Critical for Codex: `codexbar usage --provider codex --source
+/// cli` invokes `codex` under the hood, and without `~/.codex/auth.json`
+/// Codex CLI opens a new browser tab every call — our 60s cadence would
+/// otherwise spam the user with login tabs forever.
+///
+/// The user resumes polling by pressing `r`, which broadcasts `Refresh`
+/// to every worker and clears the paused flag.
+fn maybe_pause_after(
+    provider: &ProviderId,
+    command: Command,
+    state: &AppState,
+    handles: &[WorkerHandle],
+) {
+    let Some(snap) = state.snapshot(provider) else {
+        return;
+    };
+    let should_pause = matches!(
+        snap.health,
+        ProviderHealth::AuthMissing
+            | ProviderHealth::NotSupportedOnLinux
+            | ProviderHealth::Error { .. }
+    );
+    if should_pause {
+        pause_worker(handles, provider, command);
     }
 }
 
