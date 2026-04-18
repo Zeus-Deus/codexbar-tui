@@ -1,0 +1,22 @@
+[
+  {
+    "error" : {
+      "code" : 1,
+      "kind" : "runtime",
+      "message" : "Error: selected source requires web support and is only supported on macOS."
+    },
+    "provider" : "claude",
+    "source" : "auto"
+  }
+]
+[
+  {
+    "error" : {
+      "code" : 1,
+      "kind" : "provider",
+      "message" : "Error"
+    },
+    "provider" : "cli",
+    "source" : "cli"
+  }
+]

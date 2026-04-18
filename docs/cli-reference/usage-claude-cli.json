@@ -1,0 +1,27 @@
+[
+  {
+    "provider" : "claude",
+    "source" : "claude",
+    "usage" : {
+      "identity" : {
+        "providerID" : "claude"
+      },
+      "primary" : {
+        "usedPercent" : 45,
+        "windowMinutes" : 300
+      },
+      "secondary" : {
+        "resetDescription" : "ResetsApr23,8:59pm(Europe\/Brussels)",
+        "resetsAt" : "2026-04-23T18:59:00Z",
+        "usedPercent" : 15,
+        "windowMinutes" : 10080
+      },
+      "tertiary" : {
+        "usedPercent" : 0,
+        "windowMinutes" : 10080
+      },
+      "updatedAt" : "2026-04-18T17:24:14Z"
+    },
+    "version" : "2.1.114"
+  }
+]

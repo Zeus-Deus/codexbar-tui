@@ -1,0 +1,42 @@
+CodexBar unknown
+
+Usage:
+  codexbar usage [--format text|json]
+               [--json]
+               [--json-only]
+               [--json-output] [--log-level <trace|verbose|debug|info|warning|error|critical>] [-v|--verbose]
+               [--provider codex|claude|cursor|opencode|opencodego|alibaba-coding-plan|factory|gemini|antigravity|copilot|zai|minimax|kimi|kilo|kiro|vertexai|augment|jetbrains|kimik2|amp|ollama|synthetic|warp|openrouter|perplexity|both|all]
+               [--account <label>] [--account-index <index>] [--all-accounts]
+               [--no-credits] [--no-color] [--pretty] [--status] [--source <auto|web|cli|oauth|api>]
+               [--web-timeout <seconds>] [--web-debug-dump-html] [--antigravity-plan-debug] [--augment-debug]
+
+Description:
+  Print usage from enabled providers as text (default) or JSON. Honors your in-app toggles.
+  Output format: use --json (or --format json) for JSON on stdout; use --json-output for JSON logs on stderr.
+  Source behavior is provider-specific:
+  - Codex: OpenAI web dashboard (usage limits, credits remaining, code review remaining, usage breakdown).
+    Auto falls back to Codex CLI only when cookies are missing.
+  - Claude: claude.ai API.
+    Auto falls back to Claude CLI only when cookies are missing.
+  - Kilo: app.kilo.ai API.
+    Auto falls back to Kilo CLI when API credentials are missing or unauthorized.
+  Token accounts are loaded from ~/.codexbar/config.json.
+  Use --account or --account-index to select a specific token account, or --all-accounts to fetch all.
+  Account selection requires a single provider.
+
+Global flags:
+  -h, --help      Show help
+  -V, --version   Show version
+  -v, --verbose   Enable verbose logging
+  --no-color      Disable ANSI colors in text output
+  --log-level <trace|verbose|debug|info|warning|error|critical>
+  --json-output   Emit machine-readable logs (JSONL) to stderr
+
+Examples:
+  codexbar usage
+  codexbar usage --provider claude
+  codexbar usage --provider gemini
+  codexbar usage --format json --provider all --pretty
+  codexbar usage --provider all --json
+  codexbar usage --status
+  codexbar usage --provider codex --source web --format json --pretty

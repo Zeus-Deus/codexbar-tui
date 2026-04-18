@@ -1,0 +1,17 @@
+CodexBar unknown
+
+Usage:
+  codexbar cost [--format text|json]
+               [--json]
+               [--json-only]
+               [--json-output] [--log-level <trace|verbose|debug|info|warning|error|critical>] [-v|--verbose]
+               [--provider codex|claude|cursor|opencode|opencodego|alibaba-coding-plan|factory|gemini|antigravity|copilot|zai|minimax|kimi|kilo|kiro|vertexai|augment|jetbrains|kimik2|amp|ollama|synthetic|warp|openrouter|perplexity|both|all]
+               [--no-color] [--pretty] [--refresh]
+
+Description:
+  Print local token cost usage from Claude/Codex native logs plus supported pi sessions.
+  This does not require web or CLI access and uses cached scan results unless --refresh is provided.
+
+Examples:
+  codexbar cost
+  codexbar cost --provider claude --format json --pretty

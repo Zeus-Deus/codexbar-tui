@@ -1,0 +1,33 @@
+[
+  {
+    "provider" : "claude",
+    "source" : "claude",
+    "status" : {
+      "description" : "All Systems Operational",
+      "indicator" : "none",
+      "updatedAt" : "2026-04-18T15:33:48Z",
+      "url" : "https:\/\/status.claude.com\/"
+    },
+    "usage" : {
+      "identity" : {
+        "providerID" : "claude"
+      },
+      "primary" : {
+        "usedPercent" : 47,
+        "windowMinutes" : 300
+      },
+      "secondary" : {
+        "resetDescription" : "ResetsApr23,9pm(Europe\/Brussels)",
+        "resetsAt" : "2026-04-23T19:00:00Z",
+        "usedPercent" : 16,
+        "windowMinutes" : 10080
+      },
+      "tertiary" : {
+        "usedPercent" : 0,
+        "windowMinutes" : 10080
+      },
+      "updatedAt" : "2026-04-18T17:39:27Z"
+    },
+    "version" : "2.1.114"
+  }
+]

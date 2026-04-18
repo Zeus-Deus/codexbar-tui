@@ -1,0 +1,22 @@
+[
+  {
+    "error" : {
+      "code" : 1,
+      "kind" : "provider",
+      "message" : "Codex connection failed: codex account authentication required to read rate limits"
+    },
+    "provider" : "codex",
+    "source" : "cli"
+  }
+]
+[
+  {
+    "error" : {
+      "code" : 1,
+      "kind" : "provider",
+      "message" : "Error"
+    },
+    "provider" : "cli",
+    "source" : "cli"
+  }
+]

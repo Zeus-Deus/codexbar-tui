@@ -1,0 +1,22 @@
+CodexBar unknown
+
+Usage:
+  codexbar config validate [--format text|json]
+                         [--json]
+                         [--json-only]
+                         [--json-output] [--log-level <trace|verbose|debug|info|warning|error|critical>]
+                         [-v|--verbose]
+                         [--pretty]
+  codexbar config dump [--format text|json]
+                     [--json]
+                     [--json-only]
+                     [--json-output] [--log-level <trace|verbose|debug|info|warning|error|critical>]
+                     [-v|--verbose]
+                     [--pretty]
+
+Description:
+  Validate or print the CodexBar config file (default: validate).
+
+Examples:
+  codexbar config validate --format json --pretty
+  codexbar config dump --pretty
