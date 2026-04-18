@@ -1,3 +1,4 @@
+mod config;
 mod merge;
 mod parse;
 mod poll;
