@@ -1,13 +1,11 @@
 //! ratatui rendering.
 //!
-//! One vertical panel per enabled provider. Each panel contains:
-//!   * title bar (provider label + health indicator)
-//!   * session quota bar (5h)
-//!   * weekly bar (7d)
-//!   * weekly opus bar (Claude only, when present)
-//!   * reset countdowns (computed every frame from resets_at - now)
-//!   * cost today / last-30-days
-//!   * top 3 models by cost
+//! One horizontal ROW per provider: each panel is a bordered, 3-line-tall
+//! strip that spans the full terminal width. Inside the strip we lay out
+//! content horizontally — windows (inline bars), then cost, then top model.
+//! This trades the old column-per-provider layout (which turned into
+//! postage-stamp columns once codexbar enabled more than a handful of
+//! providers) for a scannable vertical list.
 //!
 //! No theme-file parsing: we emit `Color::{Red,Yellow,Green,Cyan,...}` and
 //! let the user's terminal theme resolve them. See
@@ -19,11 +17,18 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 use crate::merge::{ModelShare, ProviderHealth, ProviderId, ProviderSnapshot, QuotaBar};
 use crate::state::AppState;
+
+/// Per-provider row height: 1 line top border (carries the title), 1 content
+/// line, 1 line bottom border. 16 providers at 3 lines each = 48 lines,
+/// which fits on a standard Omarchy terminal (50+ rows). On shorter
+/// terminals the bottom providers get clipped by ratatui — acceptable for
+/// v1; the user can trim via `hidden_providers` in config.toml.
+const PROVIDER_ROW_HEIGHT: u16 = 3;
 
 pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
     let size = f.area();
@@ -35,14 +40,14 @@ pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
         let constraints: Vec<Constraint> = state
             .providers
             .iter()
-            .map(|_| Constraint::Percentage(100 / state.providers.len().max(1) as u16))
+            .map(|_| Constraint::Length(PROVIDER_ROW_HEIGHT))
             .collect();
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
             .constraints(constraints)
             .split(body);
-        for (slot, provider) in columns.iter().zip(state.providers.iter()) {
-            draw_provider(f, *slot, provider, state.snapshot(provider), now);
+        for (slot, provider) in rows.iter().zip(state.providers.iter()) {
+            draw_provider_row(f, *slot, provider, state.snapshot(provider), now);
         }
     }
 
@@ -80,10 +85,10 @@ fn vertical_split<const N: usize>(area: Rect, constraints: [Constraint; N]) -> [
 }
 
 // ---------------------------------------------------------------------------
-// Provider panel
+// Provider row
 // ---------------------------------------------------------------------------
 
-fn draw_provider(
+fn draw_provider_row(
     f: &mut Frame,
     area: Rect,
     provider: &ProviderId,
@@ -91,67 +96,66 @@ fn draw_provider(
     now: DateTime<Utc>,
 ) {
     let (title_text, title_style) = panel_title(provider, snapshot);
-    let block = Block::default()
+    let fetched_label = snapshot.map(|s| fetched_ago(s, now));
+
+    let mut block = Block::default()
         .title(title_text)
         .title_style(title_style)
         .borders(Borders::ALL);
+    if let Some(label) = &fetched_label {
+        // Tuck the staleness stamp into the bottom border on the right
+        // edge so the single content line stays clean.
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                format!(" {label} "),
+                Style::default().fg(Color::DarkGray),
+            ))
+            .right_aligned(),
+        );
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let Some(snap) = snapshot else {
-        let p = Paragraph::new(Line::from(Span::styled(
-            "waiting for first poll…",
-            Style::default().fg(Color::DarkGray),
-        )))
-        .alignment(Alignment::Center);
-        f.render_widget(p, inner);
+        render_single_line(
+            f,
+            inner,
+            Line::from(Span::styled(
+                " waiting for first poll…",
+                Style::default().fg(Color::DarkGray),
+            )),
+        );
         return;
     };
 
     if !matches!(snap.health, ProviderHealth::Ok) {
-        let p = Paragraph::new(health_message(&snap.health, snap.last_error.as_deref()))
-            .wrap(Wrap { trim: true })
-            .alignment(Alignment::Center);
-        f.render_widget(p, inner);
+        render_single_line(f, inner, health_line(&snap.health, snap.last_error.as_deref()));
         return;
     }
 
-    // Healthy panel layout — dynamic, one 3-row bar per present window:
-    //   N x quota bars  (3 each)
-    //   spacer          (1)
-    //   cost line       (1)
-    //   models          (0..=3)
-    //   fill            (>=1)
-    //   fetched-ago     (1)
-    let bar_rows = snap.windows.len() as u16 * 3;
-    let model_rows = models_rows(&snap.top_models_today) as u16;
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
+    // Healthy row: horizontal split into bars | cost | top model.
+    //   - bars: take whatever's left after the two right-hand fixed columns.
+    //   - cost: compact "Today $x.xx   30d $y.yy" stamp.
+    //   - top model: "claude-haiku-4-5  100%  $84.76".
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(bar_rows),
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // cost line
-            Constraint::Length(model_rows),
-            Constraint::Min(1),    // fill
-            Constraint::Length(1), // fetched-ago
+            Constraint::Min(30),     // bars -- greedy
+            Constraint::Length(26),  // cost
+            Constraint::Length(34),  // top model
         ])
         .split(inner);
 
-    // Split the bar-region into one Rect per window, stacked.
-    if !snap.windows.is_empty() {
-        let bar_constraints: Vec<Constraint> =
-            snap.windows.iter().map(|_| Constraint::Length(3)).collect();
-        let bar_slots = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(bar_constraints)
-            .split(rows[0]);
-        for (slot, bar) in bar_slots.iter().zip(snap.windows.iter()) {
-            draw_bar(f, *slot, bar, now);
-        }
-    }
-    draw_cost_line(f, rows[2], snap);
-    draw_models(f, rows[3], &snap.top_models_today);
-    draw_footer_line(f, rows[5], snap, now);
+    draw_inline_bars(f, cols[0], &snap.windows, now);
+    draw_inline_cost(f, cols[1], snap);
+    draw_inline_top_model(f, cols[2], &snap.top_models_today);
+}
+
+fn render_single_line(f: &mut Frame, area: Rect, line: Line<'_>) {
+    f.render_widget(
+        Paragraph::new(line).alignment(Alignment::Left).wrap(Wrap { trim: true }),
+        area,
+    );
 }
 
 fn panel_title(provider: &ProviderId, snap: Option<&ProviderSnapshot>) -> (String, Style) {
@@ -167,86 +171,172 @@ fn panel_title(provider: &ProviderId, snap: Option<&ProviderSnapshot>) -> (Strin
     (text, Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
-fn health_message(health: &ProviderHealth, last_error: Option<&str>) -> Vec<Line<'static>> {
+/// One-line health message for non-Ok panels. Error / auth-missing /
+/// not-supported each collapse to a single actionable string that fits
+/// inside the one content line a row panel has.
+fn health_line<'a>(health: &'a ProviderHealth, last_error: Option<&'a str>) -> Line<'a> {
     match health {
-        ProviderHealth::AuthMissing => vec![
-            Line::from(Span::styled(
-                "Authentication missing",
+        ProviderHealth::AuthMissing => Line::from(vec![
+            Span::styled(
+                " Auth missing ",
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from("Run the provider's CLI login, e.g.:"),
-            Line::from(Span::styled("  codex login", Style::default().fg(Color::Cyan))),
-            Line::from(Span::styled("  claude  (then /login)", Style::default().fg(Color::Cyan))),
-        ],
-        ProviderHealth::NotSupportedOnLinux => vec![
-            Line::from(Span::styled(
-                "Not supported on Linux",
+            ),
+            Span::styled(
+                "— run the provider CLI login (e.g. `codex login`, `claude` then /login)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        ProviderHealth::NotSupportedOnLinux => Line::from(vec![
+            Span::styled(
+                " Not supported on Linux ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from("codexbar --source auto is macOS-only."),
-            Line::from("Use --source cli (the TUI does this by default)."),
-        ],
-        ProviderHealth::Stale { since } => vec![
-            Line::from(Span::styled(
-                "Stale snapshot",
-                Style::default().fg(Color::Yellow),
-            )),
-            Line::from(format!("last good {}", fmt_utc(*since))),
-        ],
-        ProviderHealth::Error { message } => vec![
-            Line::from(Span::styled(
-                "Error",
+            ),
+            Span::styled(
+                "— codexbar's web source is macOS-only for this provider",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        ProviderHealth::Stale { since } => Line::from(vec![
+            Span::styled(
+                " Stale snapshot ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("— last good {}", fmt_utc(*since))),
+        ]),
+        ProviderHealth::Error { message } => Line::from(vec![
+            Span::styled(
+                " Error ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::raw(message.clone())),
-        ],
-        ProviderHealth::Ok => vec![Line::from(last_error.unwrap_or("").to_string())],
+            ),
+            Span::raw(format!("— {}", truncate(message, 200))),
+        ]),
+        ProviderHealth::Ok => Line::from(Span::raw(last_error.unwrap_or(""))),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Quota bar
+// Inline content: bars / cost / top model
 // ---------------------------------------------------------------------------
 
-fn draw_bar(f: &mut Frame, area: Rect, bar: &QuotaBar, now: DateTime<Utc>) {
-    let [head, gauge] = vertical_split(area, [Constraint::Length(1), Constraint::Length(2)]);
-
-    // Label comes straight from the window itself (e.g. "5h", "weekly",
-    // "Xd"). No provider-specific labeling lives in the renderer.
-    let mut spans = vec![
-        Span::styled(
-            bar.window_label.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ];
-    if let Some(countdown) = countdown_text(bar.resets_at, now) {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            countdown,
-            Style::default().fg(Color::Cyan),
-        ));
-    } else if let Some(hint) = &bar.reset_hint {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            hint.clone(),
-            Style::default().fg(Color::DarkGray),
-        ));
+fn draw_inline_bars(f: &mut Frame, area: Rect, bars: &[QuotaBar], now: DateTime<Utc>) {
+    if bars.is_empty() {
+        render_single_line(
+            f,
+            area,
+            Line::from(Span::styled(
+                " no quota windows reported",
+                Style::default().fg(Color::DarkGray),
+            )),
+        );
+        return;
     }
-    let header = Paragraph::new(Line::from(spans));
-    f.render_widget(header, head);
 
-    let pct = bar.used_percent.min(100);
-    let color = bar_color(pct);
-    let g = Gauge::default()
-        .gauge_style(Style::default().fg(color))
-        .percent(pct as u16)
-        .label(Span::styled(
-            format!("{pct}%"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-    f.render_widget(g, gauge);
+    // Budget roughly equal space to each bar within the bars column. A
+    // "slot" is label (~7) + gauge + pct% + optional countdown.
+    let bar_slots = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(
+            std::iter::repeat_n(Constraint::Ratio(1, bars.len() as u32), bars.len())
+                .collect::<Vec<_>>(),
+        )
+        .split(area);
+
+    for (slot, bar) in bar_slots.iter().zip(bars.iter()) {
+        let pct = bar.used_percent.min(100);
+        // Gauge width: whatever's left after label + "  12% " + optional
+        // countdown. Keep a floor of 4 characters so something always
+        // renders even in a tight column.
+        let total = slot.width as usize;
+        let countdown = countdown_text(bar.resets_at, now);
+        let countdown_len = countdown.as_deref().map(|s| s.len() + 1).unwrap_or(0);
+        let overhead = bar.window_label.chars().count() + 1 + 5 + countdown_len + 2;
+        let gauge_width = total.saturating_sub(overhead).max(4);
+
+        let mut spans = vec![
+            Span::styled(
+                bar.window_label.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                text_gauge(pct, gauge_width),
+                Style::default().fg(bar_color(pct)),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("{pct:>3}%"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(cd) = countdown {
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(cd, Style::default().fg(Color::Cyan)));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), *slot);
+    }
+}
+
+/// Unicode-block text gauge. `pct` is 0..=100; width is the number of block
+/// cells between the brackets.
+fn text_gauge(pct: u8, width: usize) -> String {
+    let filled = (pct as usize * width + 50) / 100; // round-to-nearest
+    let filled = filled.min(width);
+    let empty = width - filled;
+    let mut s = String::with_capacity(width + 2);
+    s.push('▕');
+    for _ in 0..filled {
+        s.push('█');
+    }
+    for _ in 0..empty {
+        s.push('░');
+    }
+    s.push('▏');
+    s
+}
+
+fn draw_inline_cost(f: &mut Frame, area: Rect, snap: &ProviderSnapshot) {
+    let today = snap
+        .cost_today
+        .map(|c| format!("${c:.2}"))
+        .unwrap_or_else(|| "—".into());
+    let month = snap
+        .cost_30d
+        .map(|c| format!("${c:.2}"))
+        .unwrap_or_else(|| "—".into());
+    let line = Line::from(vec![
+        Span::styled("Today ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(today, Style::default().fg(Color::Cyan)),
+        Span::raw("  "),
+        Span::styled("30d ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(month, Style::default().fg(Color::Cyan)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+fn draw_inline_top_model(f: &mut Frame, area: Rect, models: &[ModelShare]) {
+    let line = match models.first() {
+        Some(m) => Line::from(vec![
+            Span::styled(
+                truncate(&m.model, 18).to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{:>3}%", m.percent_of_day),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("${:.2}", m.cost),
+                Style::default().fg(Color::Green),
+            ),
+        ]),
+        None => Line::from(Span::styled(
+            "(no models today)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+    f.render_widget(Paragraph::new(line), area);
 }
 
 fn bar_color(pct: u8) -> Color {
@@ -271,76 +361,15 @@ fn countdown_text(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Optio
     let minutes = (total_secs % 3600) / 60;
     let seconds = total_secs % 60;
     let body = if days > 0 {
-        format!("{days}d {hours}h left")
+        format!("{days}d {hours}h")
     } else if hours > 0 {
-        format!("{hours}h {minutes}m left")
+        format!("{hours}h {minutes}m")
     } else if minutes > 0 {
-        format!("{minutes}m {seconds}s left")
+        format!("{minutes}m {seconds}s")
     } else {
-        format!("{seconds}s left")
+        format!("{seconds}s")
     };
     Some(body)
-}
-
-// ---------------------------------------------------------------------------
-// Cost line + model breakdown
-// ---------------------------------------------------------------------------
-
-fn draw_cost_line(f: &mut Frame, area: Rect, snap: &ProviderSnapshot) {
-    let today = snap
-        .cost_today
-        .map(|c| format!("${c:.2}"))
-        .unwrap_or_else(|| "—".into());
-    let month = snap
-        .cost_30d
-        .map(|c| format!("${c:.2}"))
-        .unwrap_or_else(|| "—".into());
-    let line = Line::from(vec![
-        Span::styled("Today ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(today, Style::default().fg(Color::Cyan)),
-        Span::raw("   "),
-        Span::styled("30d ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(month, Style::default().fg(Color::Cyan)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
-}
-
-fn models_rows(models: &[ModelShare]) -> usize {
-    if models.is_empty() { 1 } else { models.len() }
-}
-
-fn draw_models(f: &mut Frame, area: Rect, models: &[ModelShare]) {
-    if models.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "(no models today)",
-                Style::default().fg(Color::DarkGray),
-            ))),
-            area,
-        );
-        return;
-    }
-    let lines: Vec<Line> = models
-        .iter()
-        .map(|m| {
-            Line::from(vec![
-                Span::styled(
-                    format!("{:>3}%  ", m.percent_of_day),
-                    Style::default().fg(Color::Cyan),
-                ),
-                Span::styled(
-                    truncate(&m.model, 24).to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(
-                    format!("${:.2}", m.cost),
-                    Style::default().fg(Color::Green),
-                ),
-            ])
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn truncate(s: &str, max: usize) -> &str {
@@ -351,9 +380,9 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
-fn draw_footer_line(f: &mut Frame, area: Rect, snap: &ProviderSnapshot, now: DateTime<Utc>) {
+fn fetched_ago(snap: &ProviderSnapshot, now: DateTime<Utc>) -> String {
     let age = now - snap.fetched_at;
-    let ago = if age < ChronoDuration::seconds(2) {
+    if age < ChronoDuration::seconds(2) {
         "just now".to_string()
     } else if age < ChronoDuration::minutes(1) {
         format!("{}s ago", age.num_seconds())
@@ -361,13 +390,7 @@ fn draw_footer_line(f: &mut Frame, area: Rect, snap: &ProviderSnapshot, now: Dat
         format!("{}m ago", age.num_minutes())
     } else {
         format!("{}h ago", age.num_hours())
-    };
-    let p = Paragraph::new(Line::from(vec![
-        Span::styled("fetched ", Style::default().fg(Color::DarkGray)),
-        Span::styled(ago, Style::default().fg(Color::DarkGray)),
-    ]))
-    .alignment(Alignment::Right);
-    f.render_widget(p, area);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -417,9 +440,9 @@ mod tests {
         let d2: DateTime<Utc> = "2026-04-20T12:00:00Z".parse().unwrap();
         let m1: DateTime<Utc> = "2026-04-18T12:01:10Z".parse().unwrap();
 
-        assert_eq!(countdown_text(Some(h5), now), Some("5h 0m left".into()));
-        assert_eq!(countdown_text(Some(d2), now), Some("2d 0h left".into()));
-        assert_eq!(countdown_text(Some(m1), now), Some("1m 10s left".into()));
+        assert_eq!(countdown_text(Some(h5), now), Some("5h 0m".into()));
+        assert_eq!(countdown_text(Some(d2), now), Some("2d 0h".into()));
+        assert_eq!(countdown_text(Some(m1), now), Some("1m 10s".into()));
     }
 
     #[test]
@@ -434,5 +457,30 @@ mod tests {
     fn truncate_handles_short_and_long() {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("longer-than-limit", 6), "longer");
+    }
+
+    #[test]
+    fn text_gauge_is_correct_width_and_shape() {
+        // 0% -> all empty.
+        assert_eq!(text_gauge(0, 10), "▕░░░░░░░░░░▏");
+        // 100% -> all full.
+        assert_eq!(text_gauge(100, 10), "▕██████████▏");
+        // 50% on width 10 rounds cleanly.
+        assert_eq!(text_gauge(50, 10), "▕█████░░░░░▏");
+        // Width is preserved for odd percentages (round-to-nearest).
+        let g = text_gauge(33, 10);
+        let inside: String = g.chars().filter(|&c| c == '█' || c == '░').collect();
+        assert_eq!(inside.chars().count(), 10);
+    }
+
+    #[test]
+    fn text_gauge_never_overshoots() {
+        for pct in 0u8..=100 {
+            for width in [4usize, 10, 20] {
+                let g = text_gauge(pct, width);
+                let inside: String = g.chars().filter(|&c| c == '█' || c == '░').collect();
+                assert_eq!(inside.chars().count(), width, "pct={pct} width={width}");
+            }
+        }
     }
 }
