@@ -102,15 +102,22 @@ pub fn run_codexbar(args: &[&str], timeout: Option<Duration>) -> Result<Output, 
 // Small wrapper for the two commands the TUI actually uses. Keeps the flag
 // vocabulary in one place. See docs/cli-reference/tui-needs.md.
 
-/// `codexbar usage --provider <id> --source cli --format json --no-color`,
-/// with a filesystem preflight that short-circuits the subprocess when
-/// we can prove from disk that the provider has no auth. See
+/// `codexbar usage --provider <id> --source <source> --format json --no-color`,
+/// with the right `<source>` picked via `providers::preferred_source`
+/// (Claude/Codex/Kiro get `cli`, most others get `api`, Vertex AI gets
+/// `oauth`, Antigravity/JetBrains get `local`). Hardcoding `cli` for
+/// everything was the reason Copilot, Gemini, z.ai, etc. panels all
+/// errored with `"Source 'cli' is not supported for <provider>"`.
+///
+/// Also carries a filesystem preflight that short-circuits the subprocess
+/// when we can prove from disk that the provider has no auth. See
 /// `providers::known_auth_missing` — the motivation is to stop Codex CLI
 /// from opening a new browser tab every 60 s when `~/.codex/auth.json`
 /// doesn't exist.
-pub fn usage_cli(provider: &str, timeout: Option<Duration>) -> Result<Output, SpawnError> {
+pub fn usage(provider: &str, timeout: Option<Duration>) -> Result<Output, SpawnError> {
+    let source = providers::preferred_source(provider);
     if providers::known_auth_missing(provider) {
-        return Ok(synthetic_auth_missing_output(provider, "cli"));
+        return Ok(synthetic_auth_missing_output(provider, source));
     }
     run_codexbar(
         &[
@@ -118,7 +125,7 @@ pub fn usage_cli(provider: &str, timeout: Option<Duration>) -> Result<Output, Sp
             "--provider",
             provider,
             "--source",
-            "cli",
+            source,
             "--format",
             "json",
             "--no-color",
@@ -300,9 +307,9 @@ mod tests {
     }
 
     #[test]
-    fn usage_cli_preflight_short_circuits_codex_with_no_auth_json() {
+    fn usage_preflight_short_circuits_codex_with_no_auth_json() {
         // Redirect CODEX_HOME to an empty tempdir so `auth.json` is
-        // missing. usage_cli MUST skip the subprocess and return the
+        // missing. usage MUST skip the subprocess and return the
         // synthetic AuthMissing output.
         let tmp = tempfile::tempdir().expect("tempdir");
         // SAFETY: unit tests in one module run single-threaded against
@@ -310,7 +317,7 @@ mod tests {
         unsafe {
             std::env::set_var("CODEX_HOME", tmp.path());
         }
-        let out = usage_cli("codex", None).expect("preflight never errors");
+        let out = usage("codex", None).expect("preflight never errors");
         // The key signal: elapsed is effectively zero because we never
         // spawned codexbar. A real run here takes ~15 seconds.
         assert!(out.elapsed < Duration::from_millis(100));

@@ -200,7 +200,7 @@ fn worker_loop(
 fn run_once(provider: &ProviderId, command: Command, ev_tx: &Sender<PollEvent>) {
     let cli_id = provider.cli_id();
     let result = match command {
-        Command::Usage => spawn::usage_cli(cli_id, None).map(Output::Usage),
+        Command::Usage => spawn::usage(cli_id, None).map(Output::Usage),
         Command::Cost => spawn::cost(cli_id, None).map(Output::Cost),
     };
 

@@ -37,6 +37,45 @@ pub fn is_linux_web_only(id: &str) -> bool {
     LINUX_WEB_ONLY.iter().any(|&x| x == lc)
 }
 
+/// Which `--source` mode to pass to codexbar for this provider.
+///
+/// codexbar v0.20 only accepts `cli` for a small set of providers
+/// (Claude, Codex, Kiro); most others demand `api` (env-var or device
+/// flow tokens), a couple demand `oauth` (Vertex AI) or `local`
+/// (Antigravity, JetBrains). Passing the wrong mode is hard-rejected with
+/// `"Source 'cli' is not supported for <id>"` — exactly the error the
+/// user was seeing on Copilot / Gemini / z.ai / etc. panels before this
+/// lookup existed.
+///
+/// Unknown providers fall back to `cli` (conservative — codexbar will
+/// reply with a clear "Source 'cli' is not supported" message that the
+/// existing error path surfaces, which is still more useful than a
+/// silent skip).
+pub fn preferred_source(id: &str) -> &'static str {
+    match id.trim().to_ascii_lowercase().as_str() {
+        // CLI-source providers (local tool spawned by codexbar).
+        "claude" | "codex" | "kiro" => "cli",
+
+        // OAuth / ADC-file providers.
+        "vertexai" => "oauth",
+
+        // Local-only (no network): localhost RPC, IDE config, etc.
+        "antigravity" | "jetbrains" => "local",
+
+        // Everything else on the Linux-usable list speaks `api`:
+        // env-var API keys (z.ai / Warp / OpenRouter / Kimi K2 / Kimi /
+        // Synthetic / Alibaba), device-flow tokens stored in
+        // ~/.codexbar/config.json (Copilot — Linux-unreachable for now
+        // but we surface codexbar's real error), Gemini's oauth-creds
+        // extraction, and Kilo's api-first-cli-fallback mode.
+        "gemini" | "copilot" | "zai" | "warp" | "openrouter" | "kimik2" | "kimi"
+        | "synthetic" | "alibaba" | "kilo" | "augment" => "api",
+
+        // Unknown: let codexbar explain.
+        _ => "cli",
+    }
+}
+
 /// True if we can determine this provider is NOT authenticated **without
 /// spawning anything**. Used as a preflight to avoid invoking `codexbar`
 /// (which shells out to the provider CLI) when we already know the call
@@ -126,6 +165,31 @@ mod tests {
         for id in LINUX_WEB_ONLY {
             assert!(seen.insert(*id), "duplicate entry in LINUX_WEB_ONLY: {id}");
         }
+    }
+
+    #[test]
+    fn preferred_source_matches_the_upstream_audit() {
+        // The audit documented in docs/cli-reference/runtime-deps.md is the
+        // source of truth for these. Any change to this map without a
+        // matching change to the doc is a mistake.
+        assert_eq!(preferred_source("claude"), "cli");
+        assert_eq!(preferred_source("codex"), "cli");
+        assert_eq!(preferred_source("kiro"), "cli");
+        assert_eq!(preferred_source("vertexai"), "oauth");
+        assert_eq!(preferred_source("antigravity"), "local");
+        assert_eq!(preferred_source("jetbrains"), "local");
+        assert_eq!(preferred_source("gemini"), "api");
+        assert_eq!(preferred_source("copilot"), "api");
+        assert_eq!(preferred_source("zai"), "api");
+        assert_eq!(preferred_source("warp"), "api");
+        assert_eq!(preferred_source("openrouter"), "api");
+        assert_eq!(preferred_source("kimik2"), "api");
+        assert_eq!(preferred_source("synthetic"), "api");
+        // Case insensitive + leading/trailing whitespace tolerated.
+        assert_eq!(preferred_source("  CLAUDE "), "cli");
+        assert_eq!(preferred_source("Gemini"), "api");
+        // Unknown provider IDs fall back to `cli`.
+        assert_eq!(preferred_source("some-brand-new-provider"), "cli");
     }
 
     #[test]
