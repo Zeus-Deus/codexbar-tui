@@ -27,12 +27,19 @@ use crate::state::AppState;
 /// (1 line top border + 1 content line + 1 line bottom border).
 const ERROR_ROW_HEIGHT: u16 = 3;
 
-/// Row height for a healthy provider is dynamic: 2 border lines + one line
-/// per quota window (stacked vertically) + 1 stats line with cost + top
-/// model. This helper captures the formula in one place.
+/// Number of screen lines one stacked bar occupies, INCLUDING the blank
+/// spacer below it. Matters because on narrow stacks adjacent bars visually
+/// merge into one tall block without air between them — the extra line
+/// gives the eye a gutter.
+const BAR_SLOT_LINES: u16 = 2;
+
+/// Row height for a healthy provider is dynamic: 2 border lines + each
+/// quota window gets a 2-line slot (bar + spacer; the trailing spacer on
+/// the last bar doubles as the gap before the stats line) + 1 stats line
+/// with cost + top model.
 fn healthy_row_height(window_count: usize) -> u16 {
-    // 1 top border + N bar lines (min 1) + 1 stats line + 1 bottom border.
-    2 + window_count.max(1) as u16 + 1
+    let n = window_count.max(1) as u16;
+    2 + n * BAR_SLOT_LINES + 1
 }
 
 pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
@@ -298,10 +305,20 @@ fn health_line<'a>(health: &'a ProviderHealth, last_error: Option<&'a str>) -> L
 // Stacked bars + stats line
 // ---------------------------------------------------------------------------
 
-/// Render one bar per line, full-width, stacked top-to-bottom inside
-/// `area`. Each bar gets roughly `area.height / bars.len()` vertical space
-/// (1 line each at the sizes we use). `now` is threaded through so the
-/// optional countdown text stays accurate frame-to-frame.
+// Column widths shared by every bar in a stack. Labels are left-padded
+// to LABEL_COL cells so the bars align at the left, and the pct column is
+// fixed at 4 cells ("100%") so the numeric readouts align too.
+const LABEL_COL: usize = 8;
+const PCT_COL: usize = 4;
+
+/// Render one bar per line, stacked top-to-bottom inside `area`. Each bar
+/// gets a `BAR_SLOT_LINES`-tall slot (bar on the first line, blank on the
+/// second) so adjacent gauges don't visually merge into a single block.
+///
+/// Gauge width is computed **once** for the whole stack using the widest
+/// countdown in the set — that way every gauge ends at exactly the same
+/// column, regardless of whether a particular bar happens to have a
+/// `resetsAt` countdown rendered after its percent.
 fn draw_stacked_bars(f: &mut Frame, area: Rect, bars: &[QuotaBar], now: DateTime<Utc>) {
     if bars.is_empty() {
         render_single_line(
@@ -315,37 +332,50 @@ fn draw_stacked_bars(f: &mut Frame, area: Rect, bars: &[QuotaBar], now: DateTime
         return;
     }
 
-    // One line per bar.
+    // Reserve enough width in the right column for the worst-case
+    // countdown in this stack. Any bar without a countdown still gets the
+    // same gauge_width, so all gauges end at the same column.
+    let widest_countdown = bars
+        .iter()
+        .filter_map(|b| countdown_text(b.resets_at, now))
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    // countdown cell = leading space + text; 0 when no bar has a countdown.
+    let countdown_reserve = if widest_countdown > 0 {
+        widest_countdown + 1
+    } else {
+        0
+    };
+    let overhead = LABEL_COL + PCT_COL + 1 /*space before pct*/ + countdown_reserve;
+    let gauge_width = (area.width as usize).saturating_sub(overhead).max(4);
+
     let slots = Layout::default()
         .direction(Direction::Vertical)
         .constraints(
-            std::iter::repeat_n(Constraint::Length(1), bars.len()).collect::<Vec<_>>(),
+            std::iter::repeat_n(Constraint::Length(BAR_SLOT_LINES), bars.len())
+                .collect::<Vec<_>>(),
         )
         .split(area);
 
     for (slot, bar) in slots.iter().zip(bars.iter()) {
-        draw_bar_line(f, *slot, bar, now);
+        draw_bar_line(f, *slot, bar, now, gauge_width);
     }
 }
 
-/// Render a single quota bar on one line across `area`'s full width:
-/// `label  [gauge]  pct%  countdown`. The gauge flexes to fill whatever
-/// space is left after the fixed-width label / pct / optional countdown.
-fn draw_bar_line(f: &mut Frame, area: Rect, bar: &QuotaBar, now: DateTime<Utc>) {
+/// Render a single quota bar on one line:
+/// `label  [gauge]  pct%  countdown`. `gauge_width` is passed in by
+/// `draw_stacked_bars` so every bar in the stack shares the same value —
+/// gauges therefore end at the same column.
+fn draw_bar_line(
+    f: &mut Frame,
+    area: Rect,
+    bar: &QuotaBar,
+    now: DateTime<Utc>,
+    gauge_width: usize,
+) {
     let pct = bar.used_percent.min(100);
     let countdown = countdown_text(bar.resets_at, now);
-
-    // Fixed widths for the non-gauge bits. Keep the label column narrow
-    // (8 cols fits "weekly " comfortably) so the gauge gets most of the
-    // row. pct is always 4 chars ("100%"). Countdown, if present, we
-    // reserve its exact length + a leading space.
-    const LABEL_COL: usize = 8;
-    const PCT_COL: usize = 4;
-    let countdown_len = countdown.as_deref().map(|s| s.chars().count() + 1).unwrap_or(0);
-
-    let total = area.width as usize;
-    let overhead = LABEL_COL + 1 /*sp*/ + PCT_COL + 1 /*sp*/ + countdown_len;
-    let gauge_width = total.saturating_sub(overhead).max(4);
 
     let mut label = bar.window_label.clone();
     if label.chars().count() > LABEL_COL - 1 {
