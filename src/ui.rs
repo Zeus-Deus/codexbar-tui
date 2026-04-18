@@ -222,15 +222,16 @@ fn draw_provider_row(
         return;
     }
 
-    // Healthy row — inner is `windows.len() + 1` lines tall (see
-    // healthy_row_height). Stack one full-width bar per line at the top,
-    // then a single stats line at the bottom for cost + top model.
-    let bar_count = snap.windows.len().max(1);
+    // Healthy row — inner is `windows.len() * BAR_SLOT_LINES + 1` lines
+    // tall (see healthy_row_height). Give the bars area every line it
+    // needs (N slots of 2 lines each = bar + spacer) with an explicit
+    // Length, and dock the stats line at the bottom.
+    let bar_count = snap.windows.len().max(1) as u16;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(bar_count as u16), // one line per bar
-            Constraint::Length(1),                // stats line
+            Constraint::Length(bar_count * BAR_SLOT_LINES), // N × (bar + spacer)
+            Constraint::Length(1),                          // stats line
         ])
         .split(inner);
 
