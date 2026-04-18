@@ -127,8 +127,7 @@ enum ProviderHealth {
 struct QuotaBar {
     used_percent:    u8,                    // 0..=100 clamp
     window_label:    String,                // "5h" | "7d" | "weekly opus"
-    resets_at:       Option<DateTime<Utc>>,
-    resets_in:       Option<Duration>,      // computed: resets_at - now (None if unknown)
+    resets_at:       Option<DateTime<Utc>>, // countdown computed in the renderer from resets_at - now every frame
     reset_hint:      Option<String>,        // lightly-cleaned reset_description
 }
 
@@ -173,7 +172,7 @@ Combined with: if no record at all comes back within the timeout, fall back to `
 - **spawner**: `Command` → child process → captures stdout/stderr, enforces 30 s timeout.
 - **parser**: bytes → `Vec<UsageRecord>` / `CostRecord`, tolerant of concatenated arrays and of missing optional fields.
 - **merger**: latest `UsageRecord` + `CostRecord` per provider → `ProviderSnapshot`.
-- **scheduler**: one `tokio::time::interval` per (provider, command).
+- **scheduler**: one `std::thread::spawn` per (provider, command); workers post results back to the main thread over `std::sync::mpsc`. `thread::sleep` between polls. We do **not** pull in tokio for v1 — if we hit a concrete reason later (cancellable spawns, concurrent subprocess stdout, etc.) we revisit.
 - **renderer**: `AppState` → `ratatui` widgets. Omarchy theme pulled from `~/.config/omarchy/current/theme/` at startup.
 - **config**: our own `~/.config/codexbar-tui/config.toml` with provider toggles + refresh intervals. We do NOT edit `~/.codexbar/config.json`.
 
