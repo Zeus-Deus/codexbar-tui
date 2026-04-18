@@ -126,8 +126,14 @@ pub struct DailyCost {
     pub cache_read_tokens: u64,
     #[serde(default, rename = "totalTokens")]
     pub total_tokens: u64,
+    /// `None` when codexbar omitted the `totalCost` field entirely —
+    /// observed when the bucket's models include something codexbar v0.20
+    /// doesn't have pricing for (e.g. a freshly-released model). Treating
+    /// "missing" as `0.0` would hide the ambiguity: a real zero and an
+    /// unpriced day look identical to the user. Option preserves the
+    /// distinction so the renderer can show `—` rather than `$0.00`.
     #[serde(default, rename = "totalCost")]
-    pub total_cost: f64,
+    pub total_cost: Option<f64>,
     #[serde(default, rename = "modelsUsed")]
     pub models_used: Vec<String>,
     #[serde(default, rename = "modelBreakdowns")]
@@ -140,8 +146,9 @@ pub struct ModelBreakdown {
     pub model_name: String,
     #[serde(default, rename = "totalTokens")]
     pub total_tokens: u64,
+    /// Missing field = codexbar has no pricing for this model (see DailyCost).
     #[serde(default)]
-    pub cost: f64,
+    pub cost: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -396,12 +403,17 @@ mod tests {
         assert!(c.daily.len() >= 5, "need more than a handful of days");
         let first = &c.daily[0];
         assert!(first.total_tokens > 0);
-        assert!(first.total_cost > 0.0);
+        let day_total = first.total_cost.expect("audit fixture has totalCost");
+        assert!(day_total > 0.0);
         assert!(!first.model_breakdowns.is_empty());
         // Breakdown costs should roughly sum to totalCost; upstream rounding
         // is occasionally off in the trailing digit so allow 1 cent drift.
-        let sum: f64 = first.model_breakdowns.iter().map(|m| m.cost).sum();
-        assert!((sum - first.total_cost).abs() < 0.01);
+        let sum: f64 = first
+            .model_breakdowns
+            .iter()
+            .map(|m| m.cost.unwrap_or(0.0))
+            .sum();
+        assert!((sum - day_total).abs() < 0.01);
     }
 
     #[test]

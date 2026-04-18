@@ -241,12 +241,30 @@ pub fn build_snapshot(
             (Some(u), _) => {
                 snap.health = ProviderHealth::Ok;
                 // Iterate primary → secondary → tertiary in that order;
-                // keep whichever slots the provider populated. The UI
-                // renders the Vec in order and never has to know which
-                // slot was which.
-                for slot in [&u.primary, &u.secondary, &u.tertiary] {
+                // keep whichever slots the provider populated. Disambiguate
+                // when two slots would produce the same label (e.g. Claude
+                // emits both a secondary and a tertiary 10080-minute
+                // window, which would otherwise both read "weekly"): the
+                // tertiary gets tagged "weekly opus" for Claude (Anthropic's
+                // documented Opus-specific sub-limit), or a generic "(slot)"
+                // qualifier for any other provider that ever does this.
+                let slots: [(&str, &Option<crate::parse::Window>); 3] = [
+                    ("primary", &u.primary),
+                    ("secondary", &u.secondary),
+                    ("tertiary", &u.tertiary),
+                ];
+                for (slot_name, slot) in slots {
                     if let Some(w) = slot {
-                        snap.windows.push(to_bar(w));
+                        let mut bar = to_bar(w);
+                        if snap.windows.iter().any(|b| b.window_label == bar.window_label) {
+                            bar.window_label = match (target_id.as_str(), slot_name) {
+                                ("claude", "tertiary") => {
+                                    format!("{} opus", bar.window_label)
+                                }
+                                _ => format!("{} ({slot_name})", bar.window_label),
+                            };
+                        }
+                        snap.windows.push(bar);
                     }
                 }
             }
@@ -267,15 +285,20 @@ pub fn build_snapshot(
     if let Some(cost) = cost_record {
         if !cost.daily.is_empty() {
             let today_bucket = cost.daily.iter().find(|d| d.date == today);
-            snap.cost_today = today_bucket.map(|d| d.total_cost);
+            // Preserve `None` when today's bucket omitted `totalCost`
+            // (codexbar does this for days whose models it can't price —
+            // e.g. freshly-released models). The renderer shows "—" in
+            // that case, distinguishable from a real $0.00 day.
+            snap.cost_today = today_bucket.and_then(|d| d.total_cost);
             snap.top_models_today = top_models(today_bucket);
 
-            // Last 30 entries: daily is unordered but rows are one-per-day,
-            // so sort descending and take the head.
+            // 30-day rolling sum: sort descending and take the head.
+            // Missing `totalCost` counts as zero for the tally (we'd
+            // rather under-report than skip the day entirely).
             let mut by_date: Vec<&DailyCost> = cost.daily.iter().collect();
             by_date.sort_by(|a, b| b.date.cmp(&a.date));
             let slice = &by_date[..by_date.len().min(30)];
-            let sum: f64 = slice.iter().map(|d| d.total_cost).sum();
+            let sum: f64 = slice.iter().map(|d| d.total_cost.unwrap_or(0.0)).sum();
             snap.cost_30d = Some(sum);
         }
     }
@@ -285,15 +308,22 @@ pub fn build_snapshot(
 
 fn top_models(today: Option<&DailyCost>) -> Vec<ModelShare> {
     let Some(day) = today else { return Vec::new() };
-    let day_cost = day.total_cost.max(f64::EPSILON); // avoid /0 when cost==0
+    // When the whole day is unpriced (totalCost missing from the JSON)
+    // treat the denominator as epsilon so percent_of_day computes to 0
+    // instead of panicking on a 0/0. Individual breakdowns without a
+    // `cost` field similarly count as 0 dollars.
+    let day_cost = day.total_cost.unwrap_or(0.0).max(f64::EPSILON);
     let mut models: Vec<ModelShare> = day
         .model_breakdowns
         .iter()
-        .map(|m| ModelShare {
-            model: m.model_name.clone(),
-            cost: m.cost,
-            tokens: m.total_tokens,
-            percent_of_day: ((m.cost / day_cost) * 100.0).round().clamp(0.0, 100.0) as u8,
+        .map(|m| {
+            let c = m.cost.unwrap_or(0.0);
+            ModelShare {
+                model: m.model_name.clone(),
+                cost: c,
+                tokens: m.total_tokens,
+                percent_of_day: ((c / day_cost) * 100.0).round().clamp(0.0, 100.0) as u8,
+            }
         })
         .collect();
     models.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
@@ -338,12 +368,15 @@ mod tests {
         assert!(matches!(snap.health, ProviderHealth::Ok));
         assert_eq!(snap.windows.len(), 3, "claude populates all three windows");
         assert_eq!(snap.windows[0].window_label, "5h"); // primary
-        assert_eq!(snap.windows[1].window_label, "weekly"); // secondary
+        assert_eq!(snap.windows[1].window_label, "weekly"); // secondary -- all models
         assert!(
             snap.windows[1].resets_at.is_some(),
-            "weekly carries resetsAt"
+            "secondary weekly carries resetsAt"
         );
-        assert_eq!(snap.windows[2].window_label, "weekly"); // tertiary -- now same label
+        // Tertiary is Claude's Opus-specific weekly sub-limit. The
+        // merger disambiguates the label since both weeklies would
+        // otherwise read the same.
+        assert_eq!(snap.windows[2].window_label, "weekly opus");
         assert!(snap.cost_today.is_some());
         assert!(snap.cost_30d.is_some());
         assert!(!snap.top_models_today.is_empty());
@@ -450,7 +483,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
                     total_tokens: 0,
-                    total_cost: 17.17,
+                    total_cost: Some(17.17),
                     models_used: vec![],
                     model_breakdowns: vec![],
                 },
@@ -461,7 +494,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
                     total_tokens: 0,
-                    total_cost: 18.18,
+                    total_cost: Some(18.18),
                     models_used: vec![],
                     model_breakdowns: vec![],
                 },
