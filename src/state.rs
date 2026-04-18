@@ -56,6 +56,11 @@ pub struct AppState {
     /// Sticky status line at the bottom: "Refreshing Claude usage…",
     /// "codexbar not found", that kind of thing.
     pub status_line: Option<String>,
+    /// Body-level message shown only when `providers` is empty. Set at
+    /// startup based on why the list is empty (codexbar missing vs. dump
+    /// returned nothing vs. everything filtered out). The renderer reads
+    /// this INSTEAD of a hardcoded empty-state string.
+    pub empty_reason: Option<String>,
     pub should_quit: bool,
 }
 
@@ -66,8 +71,13 @@ impl AppState {
             intervals: intervals.clamped(),
             snapshots: HashMap::new(),
             status_line: None,
+            empty_reason: None,
             should_quit: false,
         }
+    }
+
+    pub fn set_empty_reason<S: Into<String>>(&mut self, msg: S) {
+        self.empty_reason = Some(msg.into());
     }
 
     /// Write a fresh snapshot in, replacing any prior one for the provider.

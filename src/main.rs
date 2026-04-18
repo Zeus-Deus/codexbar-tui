@@ -49,6 +49,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut state = AppState::new(providers.clone(), cfg.intervals.clone());
     state.set_status(startup_status(cfg_path.as_deref(), &provider_source, &providers));
+    if providers.is_empty() {
+        state.set_empty_reason(empty_state_message(&provider_source));
+    }
 
     let (rx, handles) = start_workers(&providers, cfg.intervals.usage, cfg.intervals.cost);
 
@@ -170,6 +173,26 @@ fn startup_status(
         ProviderSource::Unavailable { reason } => format!("  providers: {reason}"),
     };
     format!("{config_part}{provider_part}")
+}
+
+/// Multi-line body message shown when we have zero providers to render.
+/// The three branches match the three ways the list can be empty:
+///   * `Unavailable` — codexbar missing or its config dump was unparseable.
+///   * `DumpEmpty` — codexbar reachable but the dump carried zero entries.
+///   * `Used {...}` with post-filter emptiness — every provider was either
+///     skipped by the Linux web-only list or denied by hidden_providers.
+fn empty_state_message(source: &ProviderSource) -> String {
+    match source {
+        ProviderSource::Unavailable { reason } => format!(
+            "codexbar not available: {reason}\n\nInstall the upstream codexbar CLI or check PATH."
+        ),
+        ProviderSource::DumpEmpty => {
+            "codexbar config dump returned no provider entries.\n\nThis usually means ~/.codexbar/config.json is missing or empty.".to_string()
+        }
+        ProviderSource::Used { .. } => {
+            "No providers to show.\n\nEither codexbar lists none usable on Linux, or all of them are hidden in ~/.config/codexbar-tui/config.toml under hidden_providers.".to_string()
+        }
+    }
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {

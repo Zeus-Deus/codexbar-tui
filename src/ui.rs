@@ -30,9 +30,7 @@ pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
     let [body, footer] = vertical_split(size, [Constraint::Min(1), Constraint::Length(1)]);
 
     if state.providers.is_empty() {
-        let p = Paragraph::new("No providers enabled in ~/.config/codexbar-tui/config.toml")
-            .alignment(Alignment::Center);
-        f.render_widget(p, body);
+        draw_empty_state(f, body, state.empty_reason.as_deref());
     } else {
         let constraints: Vec<Constraint> = state
             .providers
@@ -49,6 +47,24 @@ pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
     }
 
     draw_footer(f, footer, state);
+}
+
+/// Body-level empty-state renderer. Called when AppState.providers is empty.
+/// The text comes from `state.empty_reason`, which main.rs populates at
+/// startup based on `ProviderSource`. The generic fallback is only used if
+/// main.rs somehow left it unset (shouldn't happen; kept for defensiveness).
+fn draw_empty_state(f: &mut Frame, area: Rect, reason: Option<&str>) {
+    let lines: Vec<Line> = match reason {
+        Some(msg) => msg
+            .split('\n')
+            .map(|s| Line::from(s.to_string()))
+            .collect(),
+        None => vec![Line::from("No providers to show.".to_string())],
+    };
+    let p = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, area);
 }
 
 fn vertical_split<const N: usize>(area: Rect, constraints: [Constraint; N]) -> [Rect; N] {
