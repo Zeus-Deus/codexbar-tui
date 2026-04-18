@@ -137,6 +137,46 @@ pub struct ModelBreakdown {
 }
 
 // ---------------------------------------------------------------------------
+// `codexbar config dump` payload
+// ---------------------------------------------------------------------------
+
+/// Shape of `codexbar config dump` stdout. Single top-level object, no
+/// arrays. See docs/cli-reference/config-dump-pretty.txt.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigDump {
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub providers: Vec<ConfigDumpProvider>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConfigDumpProvider {
+    pub id: String,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl ConfigDump {
+    /// IDs of providers the user has toggled on in `~/.codexbar/config.json`,
+    /// in the order upstream writes them (which is the order we render panels).
+    pub fn enabled_ids(&self) -> Vec<String> {
+        self.providers
+            .iter()
+            .filter(|p| p.enabled)
+            .map(|p| p.id.clone())
+            .collect()
+    }
+}
+
+/// Parse the stdout of `codexbar config dump`. The output is a well-formed
+/// single JSON object; this is a thin wrapper around `serde_json::from_slice`
+/// with our ParseError envelope.
+pub fn parse_config_dump(bytes: &[u8]) -> Result<ConfigDump, ParseError> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+// ---------------------------------------------------------------------------
 // Streaming parse for concatenated top-level arrays
 // ---------------------------------------------------------------------------
 
@@ -197,6 +237,7 @@ mod tests {
     const USAGE_ALL: &[u8] = include_bytes!("../docs/cli-reference/usage-all.json");
     const COST_CLAUDE: &[u8] = include_bytes!("../docs/cli-reference/cost-claude.json");
     const COST_CODEX: &[u8] = include_bytes!("../docs/cli-reference/cost-codex.json");
+    const CONFIG_DUMP: &[u8] = include_bytes!("../docs/cli-reference/config-dump.txt");
 
     #[test]
     fn usage_claude_cli_success() {
@@ -295,5 +336,30 @@ mod tests {
     #[test]
     fn malformed_input_is_an_error() {
         assert!(parse_usage(b"not json").is_err());
+    }
+
+    #[test]
+    fn config_dump_is_parsed() {
+        let c = parse_config_dump(CONFIG_DUMP).unwrap();
+        assert_eq!(c.version, 1);
+        assert!(!c.providers.is_empty());
+        // On the audit fixture, only `codex` is enabled.
+        let ids = c.enabled_ids();
+        assert_eq!(ids, vec!["codex".to_string()]);
+        // Sanity: claude appears but is disabled.
+        assert!(c.providers.iter().any(|p| p.id == "claude" && !p.enabled));
+    }
+
+    #[test]
+    fn config_dump_preserves_order() {
+        // Synthetic dump: the enabled order must match the order we feed in.
+        let body = br#"{"version":1,"providers":[
+            {"id":"codex","enabled":true},
+            {"id":"claude","enabled":false},
+            {"id":"gemini","enabled":true},
+            {"id":"warp","enabled":true}
+        ]}"#;
+        let c = parse_config_dump(body).unwrap();
+        assert_eq!(c.enabled_ids(), vec!["codex", "gemini", "warp"]);
     }
 }
