@@ -6,3 +6,5 @@ Thin Rust TUI on top of the upstream `codexbar` CLI (steipete/CodexBar). Reads i
 - AUR package: `~/aur-repos/codexbar-tui/`
 
 The upstream `codexbar` binary must be on `$PATH` at runtime. The AUR package declares that dependency.
+
+Provider support is dynamic: the TUI calls `codexbar config dump` at startup and renders a panel per enabled provider in that order. Do NOT hardcode provider IDs in the renderer or scheduler; users hide specific providers via a `hidden_providers = [...]` denylist in `~/.config/codexbar-tui/config.toml`.

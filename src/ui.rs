@@ -43,7 +43,7 @@ pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
             .direction(Direction::Horizontal)
             .constraints(constraints)
             .split(body);
-        for (slot, &provider) in columns.iter().zip(state.providers.iter()) {
+        for (slot, provider) in columns.iter().zip(state.providers.iter()) {
             draw_provider(f, *slot, provider, state.snapshot(provider), now);
         }
     }
@@ -70,7 +70,7 @@ fn vertical_split<const N: usize>(area: Rect, constraints: [Constraint; N]) -> [
 fn draw_provider(
     f: &mut Frame,
     area: Rect,
-    provider: ProviderId,
+    provider: &ProviderId,
     snapshot: Option<&ProviderSnapshot>,
     now: DateTime<Utc>,
 ) {
@@ -100,43 +100,45 @@ fn draw_provider(
         return;
     }
 
-    // Layout the healthy provider panel:
-    //   session bar   (3)
-    //   weekly bar    (3)
-    //   opus bar      (3) — only if Claude and present; otherwise 0 and spacer
-    //   cost line     (1)
-    //   models (upto)(4)
-    //   last-updated  (1, bottom)
-    let has_opus = snap.weekly_opus.is_some();
+    // Healthy panel layout — dynamic, one 3-row bar per present window:
+    //   N x quota bars  (3 each)
+    //   spacer          (1)
+    //   cost line       (1)
+    //   models          (0..=3)
+    //   fill            (>=1)
+    //   fetched-ago     (1)
+    let bar_rows = snap.windows.len() as u16 * 3;
+    let model_rows = models_rows(&snap.top_models_today) as u16;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),                                         // session
-            Constraint::Length(3),                                         // weekly
-            Constraint::Length(if has_opus { 3 } else { 0 }),              // opus
-            Constraint::Length(1),                                         // spacer
-            Constraint::Length(1),                                         // cost line
-            Constraint::Length(models_rows(&snap.top_models_today) as u16),
-            Constraint::Min(1),                                            // fill
-            Constraint::Length(1),                                         // footer (updated)
+            Constraint::Length(bar_rows),
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // cost line
+            Constraint::Length(model_rows),
+            Constraint::Min(1),    // fill
+            Constraint::Length(1), // fetched-ago
         ])
         .split(inner);
 
-    if let Some(bar) = &snap.session {
-        draw_bar(f, rows[0], "Session", bar, now);
+    // Split the bar-region into one Rect per window, stacked.
+    if !snap.windows.is_empty() {
+        let bar_constraints: Vec<Constraint> =
+            snap.windows.iter().map(|_| Constraint::Length(3)).collect();
+        let bar_slots = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(bar_constraints)
+            .split(rows[0]);
+        for (slot, bar) in bar_slots.iter().zip(snap.windows.iter()) {
+            draw_bar(f, *slot, bar, now);
+        }
     }
-    if let Some(bar) = &snap.weekly {
-        draw_bar(f, rows[1], "Weekly", bar, now);
-    }
-    if has_opus {
-        draw_bar(f, rows[2], "Weekly Opus", snap.weekly_opus.as_ref().unwrap(), now);
-    }
-    draw_cost_line(f, rows[4], snap);
-    draw_models(f, rows[5], &snap.top_models_today);
-    draw_footer_line(f, rows[7], snap, now);
+    draw_cost_line(f, rows[2], snap);
+    draw_models(f, rows[3], &snap.top_models_today);
+    draw_footer_line(f, rows[5], snap, now);
 }
 
-fn panel_title(provider: ProviderId, snap: Option<&ProviderSnapshot>) -> (String, Style) {
+fn panel_title(provider: &ProviderId, snap: Option<&ProviderSnapshot>) -> (String, Style) {
     let (glyph, color) = match snap.map(|s| &s.health) {
         Some(ProviderHealth::Ok) => ("●", Color::Green),
         Some(ProviderHealth::Stale { .. }) => ("●", Color::Yellow),
@@ -192,15 +194,15 @@ fn health_message(health: &ProviderHealth, last_error: Option<&str>) -> Vec<Line
 // Quota bar
 // ---------------------------------------------------------------------------
 
-fn draw_bar(f: &mut Frame, area: Rect, label: &str, bar: &QuotaBar, now: DateTime<Utc>) {
+fn draw_bar(f: &mut Frame, area: Rect, bar: &QuotaBar, now: DateTime<Utc>) {
     let [head, gauge] = vertical_split(area, [Constraint::Length(1), Constraint::Length(2)]);
 
+    // Label comes straight from the window itself (e.g. "5h", "weekly",
+    // "Xd"). No provider-specific labeling lives in the renderer.
     let mut spans = vec![
-        Span::styled(label, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
         Span::styled(
-            format!("{} window", bar.window_label),
-            Style::default().fg(Color::DarkGray),
+            bar.window_label.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
         ),
     ];
     if let Some(countdown) = countdown_text(bar.resets_at, now) {

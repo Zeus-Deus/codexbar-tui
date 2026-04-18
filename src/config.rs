@@ -1,21 +1,32 @@
 //! User config for codexbar-tui.
 //!
 //! File: `~/.config/codexbar-tui/config.toml` (XDG via `directories`).
-//! Missing file -> defaults (Claude + Codex enabled, 60s/300s intervals).
-//! Malformed file -> error, surfaced as a status-line message at startup.
+//!
+//! The provider *list* is not set here — it comes from `codexbar config dump`
+//! at startup so we automatically pick up whatever providers the user has
+//! enabled upstream. This file just lets the user:
+//!
+//!   1. Hide specific providers the TUI should skip, even if codexbar has
+//!      them enabled. (Denylist, applied over codexbar's enabled set.)
+//!   2. Tune refresh intervals.
 //!
 //! Shape:
 //!
 //! ```toml
-//! providers = ["claude", "codex"]   # subset of {"claude", "codex"}; unknown names are ignored
+//! # Optional. IDs as they appear in `codexbar config dump` providers[].id
+//! # (e.g. "codex", "claude", "cursor", "zai"...). Match is case-insensitive.
+//! hidden_providers = ["factory", "perplexity"]
 //!
 //! [refresh]
-//! usage_secs = 60                   # clamped to >= 30
-//! cost_secs  = 300                  # clamped to >= 30
+//! usage_secs = 60    # clamped to >= 30
+//! cost_secs  = 300   # clamped to >= 30
 //! ```
 //!
-//! We do **not** ever write this file from the TUI — it's user-owned.
+//! Missing file -> defaults (no denylist, 60s / 300s intervals).
+//! Malformed file -> error, surfaced as a status-line message at startup.
+//! We never write this file from the TUI -- it's user-owned.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -24,7 +35,6 @@ use directories::ProjectDirs;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::merge::ProviderId;
 use crate::state::RefreshIntervals;
 
 #[derive(Debug, Error)]
@@ -43,28 +53,26 @@ pub enum ConfigError {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Config {
-    pub providers: Vec<ProviderId>,
+    /// Lower-cased provider IDs the user wants hidden. Compared against
+    /// `codexbar config dump` IDs after normalising both to lower-case.
+    pub hidden: HashSet<String>,
     pub intervals: RefreshIntervals,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            providers: vec![ProviderId::Claude, ProviderId::Codex],
-            intervals: RefreshIntervals::default(),
-        }
+impl Config {
+    pub fn is_hidden(&self, id: &str) -> bool {
+        self.hidden.contains(&id.trim().to_ascii_lowercase())
     }
 }
 
 /// Disk representation — only deserialize from this; never serialize it
-/// back. Deserialize tolerant (unknown fields ignored, missing sections
-/// fall back to defaults).
+/// back. `deny_unknown_fields` makes typos surface loudly.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct Raw {
-    providers: Option<Vec<String>>,
+    hidden_providers: Option<Vec<String>>,
     refresh: Option<RawRefresh>,
 }
 
@@ -112,19 +120,12 @@ pub fn load_from(path: &std::path::Path) -> Result<(Config, Option<PathBuf>), Co
 fn merge_with_defaults(raw: Raw) -> Config {
     let mut cfg = Config::default();
 
-    if let Some(names) = raw.providers {
-        cfg.providers = names
+    if let Some(names) = raw.hidden_providers {
+        cfg.hidden = names
             .into_iter()
-            .filter_map(|n| match n.trim().to_ascii_lowercase().as_str() {
-                "claude" => Some(ProviderId::Claude),
-                "codex" => Some(ProviderId::Codex),
-                _ => None, // silently skip unknowns; v1 only supports these two
-            })
+            .map(|n| n.trim().to_ascii_lowercase())
+            .filter(|n| !n.is_empty())
             .collect();
-        // Preserve at least one provider so the TUI has something to render.
-        if cfg.providers.is_empty() {
-            cfg.providers = vec![ProviderId::Claude, ProviderId::Codex];
-        }
     }
 
     if let Some(r) = raw.refresh {
@@ -157,7 +158,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let (cfg, found) = load_from(&path).unwrap();
         assert!(found.is_none());
-        assert_eq!(cfg.providers, vec![ProviderId::Claude, ProviderId::Codex]);
+        assert!(cfg.hidden.is_empty());
         assert_eq!(cfg.intervals.usage, Duration::from_secs(60));
     }
 
@@ -165,7 +166,7 @@ mod tests {
     fn parses_full_file() {
         let f = write_tmp(
             r#"
-providers = ["claude"]
+hidden_providers = ["factory", "Perplexity"]
 
 [refresh]
 usage_secs = 120
@@ -174,23 +175,27 @@ cost_secs = 600
         );
         let (cfg, found) = load_from(f.path()).unwrap();
         assert!(found.is_some());
-        assert_eq!(cfg.providers, vec![ProviderId::Claude]);
+        assert!(cfg.is_hidden("factory"));
+        assert!(cfg.is_hidden("perplexity"));
+        assert!(cfg.is_hidden("PERPLEXITY"), "lookup is case-insensitive");
+        assert!(!cfg.is_hidden("claude"));
         assert_eq!(cfg.intervals.usage, Duration::from_secs(120));
         assert_eq!(cfg.intervals.cost, Duration::from_secs(600));
     }
 
     #[test]
-    fn unknown_providers_are_dropped_not_errors() {
-        let f = write_tmp(r#"providers = ["claude", "gemini", "copilot"]"#);
+    fn empty_hidden_list_is_not_an_error() {
+        let f = write_tmp(r#"hidden_providers = []"#);
         let (cfg, _) = load_from(f.path()).unwrap();
-        assert_eq!(cfg.providers, vec![ProviderId::Claude]);
+        assert!(cfg.hidden.is_empty());
     }
 
     #[test]
-    fn empty_provider_list_falls_back_to_defaults() {
-        let f = write_tmp(r#"providers = ["nope"]"#);
+    fn whitespace_only_entries_are_ignored() {
+        let f = write_tmp(r#"hidden_providers = ["  ", "factory"]"#);
         let (cfg, _) = load_from(f.path()).unwrap();
-        assert_eq!(cfg.providers, vec![ProviderId::Claude, ProviderId::Codex]);
+        assert!(cfg.is_hidden("factory"));
+        assert_eq!(cfg.hidden.len(), 1);
     }
 
     #[test]
@@ -209,7 +214,7 @@ cost_secs = 10
 
     #[test]
     fn malformed_toml_returns_error() {
-        let f = write_tmp("providers = [not closed");
+        let f = write_tmp("hidden_providers = [not closed");
         let err = load_from(f.path()).unwrap_err();
         assert!(matches!(err, ConfigError::Toml { .. }));
     }
@@ -217,7 +222,7 @@ cost_secs = 10
     #[test]
     fn unknown_top_level_field_is_an_error() {
         // deny_unknown_fields means typos surface loudly rather than silently.
-        let f = write_tmp(r#"providesr = ["claude"]"#);
+        let f = write_tmp(r#"hiden_providers = ["factory"]"#);
         let err = load_from(f.path()).unwrap_err();
         assert!(matches!(err, ConfigError::Toml { .. }));
     }

@@ -44,18 +44,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let mut state = AppState::new(cfg.providers.clone(), cfg.intervals.clone());
-    if let Some(path) = cfg_path {
-        state.set_status(format!("loaded config: {}", path.display()));
-    } else {
-        state.set_status("using default config (no ~/.config/codexbar-tui/config.toml)");
-    }
+    let (providers, provider_source) = resolve_providers(&cfg);
 
-    let (rx, handles) = start_workers(
-        &cfg.providers,
-        cfg.intervals.usage,
-        cfg.intervals.cost,
-    );
+    let mut state = AppState::new(providers.clone(), cfg.intervals.clone());
+    state.set_status(startup_status(cfg_path.as_deref(), &provider_source, &providers));
+
+    let (rx, handles) = start_workers(&providers, cfg.intervals.usage, cfg.intervals.cost);
 
     let mut terminal = setup_terminal()?;
     let loop_result = run_event_loop(&mut terminal, &mut state, rx, &handles);
@@ -64,6 +58,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     shutdown(handles);
 
     loop_result
+}
+
+/// Result of the startup handshake with `codexbar config dump`: either a
+/// clean read ("used"), a parse / spawn failure we can degrade past, or the
+/// empty-list case.
+enum ProviderSource {
+    /// N providers, post-denylist. Report the raw dump size so the status
+    /// line can say "12 enabled, 2 hidden -> 10 shown".
+    Used { dumped: usize, hidden: usize },
+    /// codexbar reachable but the dump had no enabled providers at all.
+    DumpEmpty,
+    /// codexbar missing from PATH or the dump failed to parse; we fall
+    /// back to an empty provider set and let the user fix it.
+    Unavailable { reason: String },
+}
+
+fn resolve_providers(cfg: &Config) -> (Vec<ProviderId>, ProviderSource) {
+    match spawn::run_codexbar(
+        &["config", "dump", "--format", "json", "--no-color"],
+        Some(Duration::from_secs(5)),
+    ) {
+        Ok(out) => match parse::parse_config_dump(&out.stdout) {
+            Ok(dump) => {
+                let dumped_ids = dump.enabled_ids();
+                let dumped = dumped_ids.len();
+                let providers: Vec<ProviderId> = dumped_ids
+                    .into_iter()
+                    .filter(|id| !cfg.is_hidden(id))
+                    .map(ProviderId::new)
+                    .collect();
+                let hidden = dumped.saturating_sub(providers.len());
+                if providers.is_empty() && dumped == 0 {
+                    (providers, ProviderSource::DumpEmpty)
+                } else {
+                    (providers, ProviderSource::Used { dumped, hidden })
+                }
+            }
+            Err(e) => (
+                Vec::new(),
+                ProviderSource::Unavailable {
+                    reason: format!("parsing codexbar config dump: {e}"),
+                },
+            ),
+        },
+        Err(e) => (
+            Vec::new(),
+            ProviderSource::Unavailable {
+                reason: format!("codexbar config dump failed: {e}"),
+            },
+        ),
+    }
+}
+
+fn startup_status(
+    cfg_path: Option<&std::path::Path>,
+    source: &ProviderSource,
+    providers: &[ProviderId],
+) -> String {
+    let config_part = match cfg_path {
+        Some(p) => format!("config: {}", p.display()),
+        None => "config: default (no ~/.config/codexbar-tui/config.toml)".to_string(),
+    };
+    let provider_part = match source {
+        ProviderSource::Used { dumped, hidden } if *hidden > 0 => {
+            format!(
+                "  providers: {} enabled, {} hidden -> {} shown",
+                dumped,
+                hidden,
+                providers.len()
+            )
+        }
+        ProviderSource::Used { dumped, .. } => {
+            format!("  providers: {dumped} from codexbar config dump")
+        }
+        ProviderSource::DumpEmpty => {
+            "  providers: codexbar config dump has none enabled".to_string()
+        }
+        ProviderSource::Unavailable { reason } => format!("  providers: {reason}"),
+    };
+    format!("{config_part}{provider_part}")
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -89,8 +163,11 @@ fn run_event_loop(
     rx: Receiver<PollEvent>,
     handles: &[WorkerHandle],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut caches: std::collections::HashMap<ProviderId, ProviderCache> =
-        state.providers.iter().map(|p| (*p, ProviderCache::default())).collect();
+    let mut caches: std::collections::HashMap<ProviderId, ProviderCache> = state
+        .providers
+        .iter()
+        .map(|p| (p.clone(), ProviderCache::default()))
+        .collect();
 
     let mut last_tick = Instant::now();
     loop {
@@ -151,13 +228,13 @@ fn apply_event(
 ) {
     match ev {
         PollEvent::Usage { provider, records } => {
-            caches.entry(provider).or_default().usage = Some(records);
-            rebuild(provider, state, caches);
+            caches.entry(provider.clone()).or_default().usage = Some(records);
+            rebuild(&provider, state, caches);
             state.clear_status();
         }
         PollEvent::Cost { provider, record } => {
-            caches.entry(provider).or_default().cost = record;
-            rebuild(provider, state, caches);
+            caches.entry(provider.clone()).or_default().cost = record;
+            rebuild(&provider, state, caches);
             state.clear_status();
         }
         PollEvent::Error {
@@ -169,28 +246,28 @@ fn apply_event(
                 Command::Usage => "usage",
                 Command::Cost => "cost",
             };
-            state.set_status(format!(
-                "{} {}: {message}",
-                provider.label(),
-                which
-            ));
+            state.set_status(format!("{} {}: {message}", provider.label(), which));
         }
     }
 }
 
 fn rebuild(
-    provider: ProviderId,
+    provider: &ProviderId,
     state: &mut AppState,
     caches: &std::collections::HashMap<ProviderId, ProviderCache>,
 ) {
-    let Some(cache) = caches.get(&provider) else {
+    let Some(cache) = caches.get(provider) else {
         return;
     };
     let Some(usage) = &cache.usage else {
         return;
     };
     let now = Utc::now();
+    // IMPORTANT: DailyCost.date is bucketed by codexbar in local time (honors
+    // $TZ; see docs/cli-reference/schema.md). Always ask for today in LOCAL
+    // time here -- using Utc::now() would pick the wrong bucket whenever the
+    // user's local date differs from the UTC date (up to ~24h drift).
     let today: NaiveDate = chrono::Local::now().date_naive();
-    let snap = build_snapshot(provider, usage, cache.cost.as_ref(), today, now);
+    let snap = build_snapshot(provider.clone(), usage, cache.cost.as_ref(), today, now);
     state.apply_snapshot(snap);
 }

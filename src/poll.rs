@@ -76,9 +76,19 @@ pub fn start_workers(
     let (ev_tx, ev_rx) = mpsc::channel::<PollEvent>();
     let mut handles = Vec::with_capacity(providers.len() * 2);
 
-    for &p in providers {
-        handles.push(spawn_worker(p, Command::Usage, usage_interval, ev_tx.clone()));
-        handles.push(spawn_worker(p, Command::Cost, cost_interval, ev_tx.clone()));
+    for p in providers {
+        handles.push(spawn_worker(
+            p.clone(),
+            Command::Usage,
+            usage_interval,
+            ev_tx.clone(),
+        ));
+        handles.push(spawn_worker(
+            p.clone(),
+            Command::Cost,
+            cost_interval,
+            ev_tx.clone(),
+        ));
     }
     // Dropping the spare ev_tx lets the main loop notice when every worker
     // has exited (channel closes).
@@ -126,7 +136,7 @@ fn worker_loop(
     cmd_rx: Receiver<WorkerCmd>,
 ) {
     loop {
-        run_once(provider, command, &ev_tx);
+        run_once(&provider, command, &ev_tx);
 
         // Wait for the next tick, but listen for manual refresh / quit.
         match cmd_rx.recv_timeout(interval) {
@@ -138,7 +148,7 @@ fn worker_loop(
     }
 }
 
-fn run_once(provider: ProviderId, command: Command, ev_tx: &Sender<PollEvent>) {
+fn run_once(provider: &ProviderId, command: Command, ev_tx: &Sender<PollEvent>) {
     let cli_id = provider.cli_id();
     let result = match command {
         Command::Usage => spawn::usage_cli(cli_id, None).map(Output::Usage),
@@ -147,9 +157,12 @@ fn run_once(provider: ProviderId, command: Command, ev_tx: &Sender<PollEvent>) {
 
     let event = match result {
         Ok(Output::Usage(out)) => match parse::parse_usage(&out.stdout) {
-            Ok(records) => PollEvent::Usage { provider, records },
+            Ok(records) => PollEvent::Usage {
+                provider: provider.clone(),
+                records,
+            },
             Err(e) => PollEvent::Error {
-                provider,
+                provider: provider.clone(),
                 command,
                 message: format!("usage parse: {e}"),
             },
@@ -159,16 +172,19 @@ fn run_once(provider: ProviderId, command: Command, ev_tx: &Sender<PollEvent>) {
                 // cost emits one record per provider at top-level; we
                 // requested --provider <id>, so take the first.
                 let record = recs.drain(..).next();
-                PollEvent::Cost { provider, record }
+                PollEvent::Cost {
+                    provider: provider.clone(),
+                    record,
+                }
             }
             Err(e) => PollEvent::Error {
-                provider,
+                provider: provider.clone(),
                 command,
                 message: format!("cost parse: {e}"),
             },
         },
         Err(e) => PollEvent::Error {
-            provider,
+            provider: provider.clone(),
             command,
             message: spawn_err_message(e),
         },

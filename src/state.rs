@@ -72,11 +72,11 @@ impl AppState {
 
     /// Write a fresh snapshot in, replacing any prior one for the provider.
     pub fn apply_snapshot(&mut self, snap: ProviderSnapshot) {
-        self.snapshots.insert(snap.provider, snap);
+        self.snapshots.insert(snap.provider.clone(), snap);
     }
 
-    pub fn snapshot(&self, provider: ProviderId) -> Option<&ProviderSnapshot> {
-        self.snapshots.get(&provider)
+    pub fn snapshot(&self, provider: &ProviderId) -> Option<&ProviderSnapshot> {
+        self.snapshots.get(provider)
     }
 
     pub fn quit(&mut self) {
@@ -104,9 +104,7 @@ mod tests {
             fetched_at: Utc::now(),
             upstream_at: None,
             health: ProviderHealth::Ok,
-            session: None,
-            weekly: None,
-            weekly_opus: None,
+            windows: Vec::new(),
             cost_today: None,
             cost_30d: None,
             top_models_today: Vec::new(),
@@ -116,15 +114,14 @@ mod tests {
 
     #[test]
     fn apply_snapshot_overwrites_prior() {
-        let mut s = AppState::new(
-            vec![ProviderId::Claude, ProviderId::Codex],
-            RefreshIntervals::default(),
-        );
-        s.apply_snapshot(stub(ProviderId::Claude));
-        let first_fetched = s.snapshot(ProviderId::Claude).unwrap().fetched_at;
+        let claude = ProviderId::new("claude");
+        let codex = ProviderId::new("codex");
+        let mut s = AppState::new(vec![claude.clone(), codex], RefreshIntervals::default());
+        s.apply_snapshot(stub(claude.clone()));
+        let first_fetched = s.snapshot(&claude).unwrap().fetched_at;
         std::thread::sleep(std::time::Duration::from_millis(2));
-        s.apply_snapshot(stub(ProviderId::Claude));
-        assert!(s.snapshot(ProviderId::Claude).unwrap().fetched_at >= first_fetched);
+        s.apply_snapshot(stub(claude.clone()));
+        assert!(s.snapshot(&claude).unwrap().fetched_at >= first_fetched);
         assert_eq!(s.snapshots.len(), 1);
     }
 
@@ -141,7 +138,10 @@ mod tests {
 
     #[test]
     fn status_line_round_trips() {
-        let mut s = AppState::new(vec![ProviderId::Claude], RefreshIntervals::default());
+        let mut s = AppState::new(
+            vec![ProviderId::new("claude")],
+            RefreshIntervals::default(),
+        );
         assert!(s.status_line.is_none());
         s.set_status("refreshing");
         assert_eq!(s.status_line.as_deref(), Some("refreshing"));

@@ -22,23 +22,74 @@ use crate::parse::{CostRecord, DailyCost, UsageRecord};
 // Domain types (see docs/cli-reference/rust-data-model.sketch.md)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ProviderId {
-    Claude,
-    Codex,
-}
+/// Opaque provider identifier. The string is whatever
+/// `codexbar config dump` emits for `providers[].id` — we do not hardcode
+/// a closed set. Known IDs at time of writing: "claude", "codex", "cursor",
+/// "opencode", "opencodego", "alibaba", "factory", "gemini", "antigravity",
+/// "copilot", "zai", "minimax", "kimi", "kilo", "kiro", "vertexai",
+/// "augment", "jetbrains", "kimik2", "amp", "ollama", "synthetic", "warp",
+/// "openrouter", "perplexity". See docs/cli-reference/linux-caveats.md for
+/// which of those are usable on Linux.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProviderId(pub String);
 
 impl ProviderId {
-    pub fn cli_id(self) -> &'static str {
-        match self {
-            ProviderId::Claude => "claude",
-            ProviderId::Codex => "codex",
-        }
+    pub fn new<S: Into<String>>(id: S) -> Self {
+        Self(id.into())
     }
-    pub fn label(self) -> &'static str {
-        match self {
-            ProviderId::Claude => "Claude",
-            ProviderId::Codex => "Codex",
+    /// The string codexbar expects on the `--provider` flag. Identity.
+    pub fn cli_id(&self) -> &str {
+        &self.0
+    }
+    /// Human-friendly panel title. Looked up in a small prettification
+    /// table; unknown IDs return the raw string capitalised.
+    pub fn label(&self) -> String {
+        pretty_name(&self.0)
+    }
+}
+
+impl std::fmt::Display for ProviderId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Tiny lookup for the providers whose canonical capitalization diverges
+/// from a naive title-case. Anything missing falls back to the raw ID with
+/// the first letter upper-cased — good enough for ad-hoc provider names.
+fn pretty_name(id: &str) -> String {
+    match id {
+        "claude" => "Claude".into(),
+        "codex" => "Codex".into(),
+        "gemini" => "Gemini".into(),
+        "copilot" => "Copilot".into(),
+        "cursor" => "Cursor".into(),
+        "opencode" => "OpenCode".into(),
+        "opencodego" => "OpenCode Go".into(),
+        "zai" => "z.ai".into(),
+        "kimi" => "Kimi".into(),
+        "kimik2" => "Kimi K2".into(),
+        "minimax" => "MiniMax".into(),
+        "kilo" => "Kilo".into(),
+        "kiro" => "Kiro".into(),
+        "vertexai" => "Vertex AI".into(),
+        "augment" => "Augment".into(),
+        "jetbrains" => "JetBrains AI".into(),
+        "antigravity" => "Antigravity".into(),
+        "amp" => "Amp".into(),
+        "ollama" => "Ollama".into(),
+        "synthetic" => "Synthetic".into(),
+        "warp" => "Warp".into(),
+        "openrouter" => "OpenRouter".into(),
+        "perplexity" => "Perplexity".into(),
+        "alibaba" => "Alibaba Coding Plan".into(),
+        "factory" => "Factory (Droid)".into(),
+        other => {
+            let mut c = other.chars();
+            match c.next() {
+                Some(first) => first.to_uppercase().chain(c).collect(),
+                None => String::new(),
+            }
         }
     }
 }
@@ -74,9 +125,10 @@ pub struct ProviderSnapshot {
     pub fetched_at: DateTime<Utc>,
     pub upstream_at: Option<DateTime<Utc>>,
     pub health: ProviderHealth,
-    pub session: Option<QuotaBar>,
-    pub weekly: Option<QuotaBar>,
-    pub weekly_opus: Option<QuotaBar>,
+    /// Any quota windows the provider exposed, in the upstream
+    /// primary → secondary → tertiary order. No provider-specific
+    /// naming lives here; each window carries its own `window_label`.
+    pub windows: Vec<QuotaBar>,
     pub cost_today: Option<f64>,
     pub cost_30d: Option<f64>,
     pub top_models_today: Vec<ModelShare>,
@@ -87,14 +139,17 @@ pub struct ProviderSnapshot {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn window_label(minutes: u32, slot: WindowSlot) -> String {
-    match (minutes, slot) {
-        (300, _) => "5h".into(),
-        (10080, WindowSlot::Secondary) => "7d".into(),
-        (10080, WindowSlot::Tertiary) => "7d opus".into(),
-        (m, _) if m % 1440 == 0 => format!("{}d", m / 1440),
-        (m, _) if m % 60 == 0 => format!("{}h", m / 60),
-        (m, _) => format!("{m}m"),
+/// Map a `windowMinutes` value to a short display string. Two well-known
+/// anchors (300 → "5h", 10080 → "weekly"); anything else falls through to a
+/// numeric `Xd`/`Xh`/`Xm`. Provider-agnostic by design — the renderer no
+/// longer knows what "opus" means.
+fn window_label(minutes: u32) -> String {
+    match minutes {
+        300 => "5h".into(),
+        10080 => "weekly".into(),
+        m if m % 1440 == 0 => format!("{}d", m / 1440),
+        m if m % 60 == 0 => format!("{}h", m / 60),
+        m => format!("{m}m"),
     }
 }
 
@@ -108,16 +163,10 @@ fn clean_reset_hint(raw: &str) -> String {
         .replace("(", " (")
 }
 
-enum WindowSlot {
-    Primary,
-    Secondary,
-    Tertiary,
-}
-
-fn to_bar(win: &crate::parse::Window, slot: WindowSlot) -> QuotaBar {
+fn to_bar(win: &crate::parse::Window) -> QuotaBar {
     QuotaBar {
         used_percent: win.used_percent.unwrap_or(0).min(100),
-        window_label: window_label(win.window_minutes, slot),
+        window_label: window_label(win.window_minutes),
         resets_at: win.resets_at,
         reset_hint: win.reset_description.as_deref().map(clean_reset_hint),
     }
@@ -162,6 +211,7 @@ pub fn build_snapshot(
     today: NaiveDate,
     now: DateTime<Utc>,
 ) -> ProviderSnapshot {
+    let target_id = provider.cli_id().to_string();
     let mut snap = ProviderSnapshot {
         provider,
         fetched_at: now,
@@ -169,9 +219,7 @@ pub fn build_snapshot(
         health: ProviderHealth::Error {
             message: "no data".into(),
         },
-        session: None,
-        weekly: None,
-        weekly_opus: None,
+        windows: Vec::new(),
         cost_today: None,
         cost_30d: None,
         top_models_today: Vec::new(),
@@ -179,7 +227,6 @@ pub fn build_snapshot(
     };
 
     // --- Usage ---------------------------------------------------------
-    let target_id = provider.cli_id();
     let record = usage_records
         .iter()
         .find(|r| r.provider == target_id)
@@ -193,15 +240,15 @@ pub fn build_snapshot(
         match (&r.usage, &r.error) {
             (Some(u), _) => {
                 snap.health = ProviderHealth::Ok;
-                snap.session = u.primary.as_ref().map(|w| to_bar(w, WindowSlot::Primary));
-                snap.weekly = u
-                    .secondary
-                    .as_ref()
-                    .map(|w| to_bar(w, WindowSlot::Secondary));
-                snap.weekly_opus = u
-                    .tertiary
-                    .as_ref()
-                    .map(|w| to_bar(w, WindowSlot::Tertiary));
+                // Iterate primary → secondary → tertiary in that order;
+                // keep whichever slots the provider populated. The UI
+                // renders the Vec in order and never has to know which
+                // slot was which.
+                for slot in [&u.primary, &u.secondary, &u.tertiary] {
+                    if let Some(w) = slot {
+                        snap.windows.push(to_bar(w));
+                    }
+                }
             }
             (None, Some(e)) => {
                 snap.health = classify_error(&e.kind, &e.message);
@@ -276,52 +323,53 @@ mod tests {
         "2026-04-18".parse().unwrap()
     }
 
+    fn claude() -> ProviderId {
+        ProviderId::new("claude")
+    }
+    fn codex() -> ProviderId {
+        ProviderId::new("codex")
+    }
+
     #[test]
-    fn claude_cli_success_builds_ok_snapshot_with_all_three_bars() {
+    fn claude_cli_success_populates_windows_in_primary_secondary_tertiary_order() {
         let usage = parse_usage(USAGE_CLAUDE_CLI).unwrap();
         let cost = parse_cost(COST_CLAUDE).unwrap();
-        let snap = build_snapshot(
-            ProviderId::Claude,
-            &usage,
-            Some(&cost[0]),
-            today(),
-            now_utc(),
-        );
+        let snap = build_snapshot(claude(), &usage, Some(&cost[0]), today(), now_utc());
         assert!(matches!(snap.health, ProviderHealth::Ok));
-        let s = snap.session.as_ref().expect("session bar");
-        assert_eq!(s.window_label, "5h");
-        let w = snap.weekly.as_ref().expect("weekly bar");
-        assert_eq!(w.window_label, "7d");
-        assert!(w.resets_at.is_some(), "weekly carries resetsAt");
-        let o = snap.weekly_opus.as_ref().expect("opus bar");
-        assert_eq!(o.window_label, "7d opus");
+        assert_eq!(snap.windows.len(), 3, "claude populates all three windows");
+        assert_eq!(snap.windows[0].window_label, "5h"); // primary
+        assert_eq!(snap.windows[1].window_label, "weekly"); // secondary
+        assert!(
+            snap.windows[1].resets_at.is_some(),
+            "weekly carries resetsAt"
+        );
+        assert_eq!(snap.windows[2].window_label, "weekly"); // tertiary -- now same label
         assert!(snap.cost_today.is_some());
         assert!(snap.cost_30d.is_some());
         assert!(!snap.top_models_today.is_empty());
-        // Top-3 cap.
         assert!(snap.top_models_today.len() <= 3);
     }
 
     #[test]
     fn codex_cli_auth_missing_is_classified() {
         let usage = parse_usage(USAGE_CODEX_CLI).unwrap();
-        let snap = build_snapshot(ProviderId::Codex, &usage, None, today(), now_utc());
+        let snap = build_snapshot(codex(), &usage, None, today(), now_utc());
         assert!(matches!(snap.health, ProviderHealth::AuthMissing));
-        assert!(snap.session.is_none());
+        assert!(snap.windows.is_empty());
         assert!(snap.last_error.is_some());
     }
 
     #[test]
     fn linux_auto_source_error_is_classified_not_supported() {
         let usage = parse_usage(USAGE_CLAUDE_AUTO).unwrap();
-        let snap = build_snapshot(ProviderId::Claude, &usage, None, today(), now_utc());
+        let snap = build_snapshot(claude(), &usage, None, today(), now_utc());
         assert!(matches!(snap.health, ProviderHealth::NotSupportedOnLinux));
     }
 
     #[test]
     fn missing_cost_record_is_not_an_error() {
         let usage = parse_usage(USAGE_CLAUDE_CLI).unwrap();
-        let snap = build_snapshot(ProviderId::Claude, &usage, None, today(), now_utc());
+        let snap = build_snapshot(claude(), &usage, None, today(), now_utc());
         assert!(matches!(snap.health, ProviderHealth::Ok));
         assert!(snap.cost_today.is_none());
         assert!(snap.cost_30d.is_none());
@@ -329,7 +377,7 @@ mod tests {
 
     #[test]
     fn empty_usage_records_surfaces_as_no_data_error() {
-        let snap = build_snapshot(ProviderId::Claude, &[], None, today(), now_utc());
+        let snap = build_snapshot(claude(), &[], None, today(), now_utc());
         assert!(matches!(snap.health, ProviderHealth::Error { .. }));
     }
 
@@ -358,11 +406,102 @@ mod tests {
 
     #[test]
     fn window_label_maps_known_minutes() {
-        assert_eq!(window_label(300, WindowSlot::Primary), "5h");
-        assert_eq!(window_label(10080, WindowSlot::Secondary), "7d");
-        assert_eq!(window_label(10080, WindowSlot::Tertiary), "7d opus");
-        assert_eq!(window_label(60, WindowSlot::Primary), "1h");
-        assert_eq!(window_label(1440, WindowSlot::Primary), "1d");
-        assert_eq!(window_label(45, WindowSlot::Primary), "45m");
+        assert_eq!(window_label(300), "5h");
+        assert_eq!(window_label(10080), "weekly");
+        assert_eq!(window_label(60), "1h");
+        assert_eq!(window_label(1440), "1d");
+        assert_eq!(window_label(45), "45m");
+        assert_eq!(window_label(20160), "14d"); // unknown cadence falls through
+    }
+
+    #[test]
+    fn provider_id_pretty_names_cover_known_and_unknown() {
+        assert_eq!(ProviderId::new("claude").label(), "Claude");
+        assert_eq!(ProviderId::new("zai").label(), "z.ai");
+        assert_eq!(ProviderId::new("opencodego").label(), "OpenCode Go");
+        // Unknown IDs capitalise the first char and pass through.
+        assert_eq!(ProviderId::new("some-new-provider").label(), "Some-new-provider");
+    }
+
+    // --- Task 1: local-vs-utc "today" alignment -------------------------
+    //
+    // Codexbar buckets cost by local calendar day (honors $TZ; see
+    // docs/cli-reference/schema.md). The caller MUST pass the local date
+    // for the cost_today lookup; feeding UTC-today on a timezone east or
+    // west of UTC will select the wrong bucket when the two dates differ.
+    //
+    // This test constructs a synthetic CostRecord where 2026-04-17 and
+    // 2026-04-18 buckets carry unambiguous sentinel costs, then asserts
+    // that the passed-in `today` decides which one lands in cost_today.
+    // main.rs invokes build_snapshot with `chrono::Local::now().date_naive()`,
+    // so in production this lookup is always local-aligned.
+    #[test]
+    fn cost_today_lookup_uses_the_provided_local_date() {
+        use crate::parse::{CostRecord, DailyCost};
+        let record = CostRecord {
+            provider: "claude".into(),
+            source: "local".into(),
+            updated_at: now_utc(),
+            daily: vec![
+                DailyCost {
+                    date: "2026-04-17".parse().unwrap(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    total_tokens: 0,
+                    total_cost: 17.17,
+                    models_used: vec![],
+                    model_breakdowns: vec![],
+                },
+                DailyCost {
+                    date: "2026-04-18".parse().unwrap(),
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: 0,
+                    total_tokens: 0,
+                    total_cost: 18.18,
+                    models_used: vec![],
+                    model_breakdowns: vec![],
+                },
+            ],
+        };
+        let usage = parse_usage(USAGE_CLAUDE_CLI).unwrap();
+
+        // Passing today=2026-04-18 (local date on this host) must pick
+        // the 18.18 bucket -- NOT 17.17 (which would be what a UTC-today
+        // would select at 23:00 local, UTC-1).
+        let snap_local = build_snapshot(
+            claude(),
+            &usage,
+            Some(&record),
+            "2026-04-18".parse().unwrap(),
+            now_utc(),
+        );
+        assert_eq!(snap_local.cost_today, Some(18.18));
+
+        // Demonstrate the bug we're guarding against: if the caller ever
+        // regresses to Utc::now().date_naive() on a user whose local
+        // midnight hasn't flipped yet, we'd see the prior-day bucket.
+        let snap_prior = build_snapshot(
+            claude(),
+            &usage,
+            Some(&record),
+            "2026-04-17".parse().unwrap(),
+            now_utc(),
+        );
+        assert_eq!(snap_prior.cost_today, Some(17.17));
+
+        // A date that isn't in the bucket list surfaces as None, not as a
+        // panic or a stale value.
+        let snap_future = build_snapshot(
+            claude(),
+            &usage,
+            Some(&record),
+            "2026-04-20".parse().unwrap(),
+            now_utc(),
+        );
+        assert_eq!(snap_future.cost_today, None);
     }
 }
