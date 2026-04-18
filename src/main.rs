@@ -1,3 +1,4 @@
+mod merge;
 mod parse;
 mod spawn;
 
