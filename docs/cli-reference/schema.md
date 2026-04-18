@@ -226,24 +226,59 @@ Codex path on this box has no sessions → `cost-codex.json` is:
 
 `daily: []` + no totals block = "nothing to show." The TUI should render "no local cost data for <provider>".
 
-## `config dump` payload
+## `config dump` payload (verified 2026-04-18)
+
+> ⚠️ **Corrected on 2026-04-18.** The previous revision of this section was written against the `config dump` *text* output (captured in `config-dump.txt`) and assumed the `--format json` output had the same field order. It does not. The real JSON output has now been captured and verified via `codexbar config dump --format json` → `config-dump.json` and `--pretty` → `config-dump-pretty.json`. The schema below is what the parser actually sees; the data model is unchanged but field order in the encoded JSON differs from what the old docs implied.
+
+**Compact form** (`config-dump.json`, 844 bytes on this v0.20 Linux box):
 
 ```json
 {
   "version": 1,
   "providers": [
-    { "id": "codex",  "enabled": true  },
-    { "id": "claude", "enabled": false },
-    /* ...each provider, in fixed order... */
+    { "enabled": true,  "id": "codex" },
+    { "enabled": false, "id": "claude" },
+    { "enabled": false, "id": "cursor" },
+    /* ...25 entries total, in fixed order... */
+    { "enabled": false, "id": "perplexity" }
   ]
 }
 ```
 
+**Pretty form** (`config-dump-pretty.json`, 1558 bytes) has the same shape with 2-space indent.
+
 | Path | Type | Nullable | Meaning |
 |---|---|---|---|
 | `version` | integer | no | Schema version (currently `1`) |
-| `providers[].id` | string | no | Provider ID — authoritative list for which providers this install knows about |
-| `providers[].enabled` | bool | no | Whether `--provider all` includes this one |
+| `providers[]` | array of object | no | All provider slots this install knows about, in upstream's fixed emit order |
+| `providers[].id` | string | no | Provider ID — one of the 25 known IDs (`codex`, `claude`, `cursor`, ...); see `commands.md` for the full list |
+| `providers[].enabled` | bool | no | macOS-GUI checkbox state. **The TUI ignores this field on Linux** (it defaults to `false` everywhere except on `codex`, for reasons that look like a default-first-provider quirk upstream). See `CLAUDE.md` for the three-layer visibility rule we use instead. |
+
+### Field-order drift between codexbar builds
+
+Observed today on Linux v0.20:
+```
+{"version":1,"providers":[{"enabled":true,"id":"codex"},...]}
+```
+
+Observed during the audit (same v0.20 binary, text-format output):
+```
+{"providers":[{"id":"codex","enabled":true},...],"version":1}
+```
+
+The two are semantically identical. Our Rust parser is field-order agnostic (plain serde `Deserialize`) and the `config_dump_pretty_parses_identically` test locks that in.
+
+### `--no-color` rejection quirk (parser has to tolerate this)
+
+codexbar v0.20 accepts `--no-color` as a "global" flag on `usage` and `cost` but **rejects it on `config dump`**, and the error doesn't come back on stderr — it comes back on stdout as a `parse_usage`-style array:
+
+```json
+[{"error":{"message":"Unknown option --no-color","kind":"args","code":1},"source":"cli","provider":"cli"}]
+```
+
+`parse_config_dump` dispatches on the first non-whitespace byte: `{` is the happy path, `[` drops into the streaming fallback and surfaces the `error.message` as `ParseError::Remote`. The TUI then displays that message in the empty-state body rather than crashing.
+
+### Token accounts
 
 Provider-level token accounts are not dumped on a fresh install. If a user has configured `tokenAccounts`, they **will** appear in dump output and must be redacted before sharing.
 

@@ -84,8 +84,14 @@ enum ProviderSource {
 }
 
 fn resolve_providers(cfg: &Config) -> (Vec<ProviderId>, ProviderSource) {
+    // NOTE: do NOT pass `--no-color` here. codexbar v0.20 rejects it on
+    // `config dump` (it is accepted as a "global" flag on `usage` / `cost`
+    // but not this subcommand) and instead emits
+    // `[{"error":{"message":"Unknown option --no-color",...}}]` on stdout,
+    // which crashes the parser. --format json output doesn't emit ANSI
+    // anyway; --no-color is pointless here.
     match spawn::run_codexbar(
-        &["config", "dump", "--format", "json", "--no-color"],
+        &["config", "dump", "--format", "json"],
         Some(Duration::from_secs(5)),
     ) {
         Ok(out) => match parse::parse_config_dump(&out.stdout) {

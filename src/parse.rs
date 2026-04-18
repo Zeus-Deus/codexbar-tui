@@ -21,6 +21,14 @@ use thiserror::Error;
 pub enum ParseError {
     #[error("json parse error: {0}")]
     Json(#[from] serde_json::Error),
+    /// codexbar returned a well-formed JSON payload whose `error` block we
+    /// extracted verbatim. Used for the case where `codexbar config dump`
+    /// rejects a flag and emits `[{"error":{"message":"Unknown option
+    /// --foo"}}]` on stdout instead of the normal ConfigDump shape.
+    #[error("codexbar rejected the request: {0}")]
+    Remote(String),
+    #[error("codexbar output shape not recognised (first bytes: {0:?})")]
+    UnknownShape(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -172,11 +180,83 @@ impl ConfigDump {
     }
 }
 
-/// Parse the stdout of `codexbar config dump`. The output is a well-formed
-/// single JSON object; this is a thin wrapper around `serde_json::from_slice`
-/// with our ParseError envelope.
+/// Parse the stdout of `codexbar config dump`.
+///
+/// Observed shapes in v0.20:
+///
+/// 1. **Happy path** — a single top-level object:
+///    `{"version":1,"providers":[{"id":"codex","enabled":true},...]}`.
+///    Field order varies across codexbar builds; serde handles that.
+///
+/// 2. **Flag-rejection path** — a top-level array of error records, same
+///    framing as `parse_usage`: `[{"error":{"message":"Unknown option
+///    --foo"}}]`. codexbar v0.20 emits this on `config dump` if it
+///    doesn't recognise one of the flags (e.g. `--no-color`).
+///
+/// We walk whichever shape we get, returning the ConfigDump on success and
+/// surfacing the error message to the caller on the second shape so the
+/// status line can say *why* startup failed rather than a raw serde error.
 pub fn parse_config_dump(bytes: &[u8]) -> Result<ConfigDump, ParseError> {
-    Ok(serde_json::from_slice(bytes)?)
+    // Dispatch on the first non-whitespace byte. `{` is the happy path
+    // (single top-level object); `[` is the flag-rejection / generic
+    // parse_usage-style framing where every value is checked for either a
+    // ConfigDump shape or an `error.message` we can surface. Anything else
+    // is a shape we don't recognise.
+    let leading = bytes
+        .iter()
+        .copied()
+        .find(|b| !b.is_ascii_whitespace());
+
+    match leading {
+        Some(b'{') => Ok(serde_json::from_slice::<ConfigDump>(bytes)?),
+        Some(b'[') => parse_streaming_config_dump(bytes),
+        _ => {
+            let head: String = bytes
+                .iter()
+                .take(80)
+                .map(|b| *b as char)
+                .collect::<String>()
+                .replace('\n', " ");
+            Err(ParseError::UnknownShape(head))
+        }
+    }
+}
+
+/// Slow path: codexbar handed us a `parse_usage`-style top-level array (or
+/// several concatenated). Walk each value and stop at the first one that is
+/// either a ConfigDump or carries an `error.message`.
+fn parse_streaming_config_dump(bytes: &[u8]) -> Result<ConfigDump, ParseError> {
+    let iter = serde_json::Deserializer::from_slice(bytes).into_iter::<Vec<serde_json::Value>>();
+    for chunk in iter {
+        let chunk = chunk?;
+        for value in &chunk {
+            if value.is_object() {
+                if let Ok(cd) = serde_json::from_value::<ConfigDump>(value.clone()) {
+                    // Only accept if the value actually looks like a dump
+                    // (has a providers array). Defaults-everywhere on
+                    // ConfigDump make serde happy to accept anything;
+                    // guard against silent data loss.
+                    if value.get("providers").is_some() {
+                        return Ok(cd);
+                    }
+                }
+                if let Some(msg) = value
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    return Err(ParseError::Remote(msg.to_string()));
+                }
+            }
+        }
+    }
+    let head: String = bytes
+        .iter()
+        .take(80)
+        .map(|b| *b as char)
+        .collect::<String>()
+        .replace('\n', " ");
+    Err(ParseError::UnknownShape(head))
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +320,9 @@ mod tests {
     const USAGE_ALL: &[u8] = include_bytes!("../docs/cli-reference/usage-all.json");
     const COST_CLAUDE: &[u8] = include_bytes!("../docs/cli-reference/cost-claude.json");
     const COST_CODEX: &[u8] = include_bytes!("../docs/cli-reference/cost-codex.json");
-    const CONFIG_DUMP: &[u8] = include_bytes!("../docs/cli-reference/config-dump.txt");
+    const CONFIG_DUMP: &[u8] = include_bytes!("../docs/cli-reference/config-dump.json");
+    const CONFIG_DUMP_PRETTY: &[u8] =
+        include_bytes!("../docs/cli-reference/config-dump-pretty.json");
 
     #[test]
     fn usage_claude_cli_success() {
@@ -342,25 +424,38 @@ mod tests {
     }
 
     #[test]
-    fn config_dump_returns_every_listed_provider() {
+    fn config_dump_parses_real_captured_output() {
         let c = parse_config_dump(CONFIG_DUMP).unwrap();
         assert_eq!(c.version, 1);
-        assert!(!c.providers.is_empty());
-        // Every provider in the dump is returned, regardless of the
-        // `enabled` flag. On this v0.20 fixture only codex is flagged
-        // enabled=true, but the TUI still shows all of them (after the
-        // Linux-skip list + user denylist are applied elsewhere).
+        // v0.20 ships 25 provider slots in the default config. Pin the
+        // count so a future codexbar release that renames/adds/drops one
+        // surfaces loudly rather than drifting silently.
+        assert_eq!(c.providers.len(), 25);
         let ids = c.ids();
-        assert!(ids.contains(&"codex".to_string()));
+        assert_eq!(ids.first().map(|s| s.as_str()), Some("codex"));
         assert!(ids.contains(&"claude".to_string()));
         assert!(ids.contains(&"gemini".to_string()));
+        assert!(ids.contains(&"vertexai".to_string()));
+        // Field-order agnosticism: the v0.20 Linux build emits
+        // {"version":1,"providers":[{"enabled":true,"id":"codex"},...]}
+        // with enabled before id; older/macOS builds emit id before enabled.
+        // Both must parse identically.
         assert_eq!(ids.len(), c.providers.len());
     }
 
     #[test]
+    fn config_dump_pretty_parses_identically() {
+        let compact = parse_config_dump(CONFIG_DUMP).unwrap();
+        let pretty = parse_config_dump(CONFIG_DUMP_PRETTY).unwrap();
+        assert_eq!(compact.version, pretty.version);
+        assert_eq!(compact.ids(), pretty.ids());
+    }
+
+    #[test]
     fn config_dump_preserves_order_regardless_of_enabled_flag() {
-        // Two of these are flagged enabled=false; ids() must still return
-        // all four in input order.
+        // Synthetic: covers the contract that ids() preserves input order
+        // and ignores the `enabled` flag. Real captures don't exercise
+        // this (every fixture has the same default order upstream emits).
         let body = br#"{"version":1,"providers":[
             {"id":"codex","enabled":true},
             {"id":"claude","enabled":false},
@@ -369,5 +464,30 @@ mod tests {
         ]}"#;
         let c = parse_config_dump(body).unwrap();
         assert_eq!(c.ids(), vec!["codex", "claude", "gemini", "warp"]);
+    }
+
+    #[test]
+    fn config_dump_flag_rejection_surfaces_message() {
+        // codexbar v0.20 emits this shape on stdout when `config dump`
+        // receives an unrecognised flag. The parser must surface the
+        // error message as ParseError::Remote so the caller can display
+        // it, not a generic serde decode error.
+        let body =
+            br#"[{"error":{"message":"Unknown option --no-color","kind":"args","code":1},"source":"cli","provider":"cli"}]"#;
+        match parse_config_dump(body) {
+            Err(ParseError::Remote(msg)) => {
+                assert!(msg.contains("--no-color"), "got: {msg}");
+            }
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn config_dump_unknown_shape_is_an_error_not_a_panic() {
+        let err = parse_config_dump(br#"42"#).unwrap_err();
+        match err {
+            ParseError::UnknownShape(_) | ParseError::Json(_) => {}
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
