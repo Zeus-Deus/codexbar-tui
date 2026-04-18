@@ -1,3 +1,5 @@
+mod parse;
+
 fn main() {
-    println!("Hello, world!");
+    println!("codexbar-tui (work in progress)");
 }
