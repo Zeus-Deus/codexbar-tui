@@ -8,11 +8,14 @@
 //! the worst-case ceiling, so the default timeout is 30 s.
 
 use std::io::{ErrorKind, Read};
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
+
+use crate::providers;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -99,8 +102,16 @@ pub fn run_codexbar(args: &[&str], timeout: Option<Duration>) -> Result<Output, 
 // Small wrapper for the two commands the TUI actually uses. Keeps the flag
 // vocabulary in one place. See docs/cli-reference/tui-needs.md.
 
-/// `codexbar usage --provider <id> --source cli --format json --no-color`
+/// `codexbar usage --provider <id> --source cli --format json --no-color`,
+/// with a filesystem preflight that short-circuits the subprocess when
+/// we can prove from disk that the provider has no auth. See
+/// `providers::known_auth_missing` — the motivation is to stop Codex CLI
+/// from opening a new browser tab every 60 s when `~/.codex/auth.json`
+/// doesn't exist.
 pub fn usage_cli(provider: &str, timeout: Option<Duration>) -> Result<Output, SpawnError> {
+    if providers::known_auth_missing(provider) {
+        return Ok(synthetic_auth_missing_output(provider, "cli"));
+    }
     run_codexbar(
         &[
             "usage",
@@ -116,8 +127,15 @@ pub fn usage_cli(provider: &str, timeout: Option<Duration>) -> Result<Output, Sp
     )
 }
 
-/// `codexbar cost --provider <id> --format json --no-color`
+/// `codexbar cost --provider <id> --format json --no-color`,
+/// with the same preflight as `usage_cli`. Cost normally doesn't invoke
+/// the provider CLI (it scans `~/.codex/sessions/**/*.jsonl` directly)
+/// but belt-and-braces: if auth is missing we have nothing meaningful
+/// to show and might as well skip the subprocess.
 pub fn cost(provider: &str, timeout: Option<Duration>) -> Result<Output, SpawnError> {
+    if providers::known_auth_missing(provider) {
+        return Ok(synthetic_auth_missing_output(provider, "local"));
+    }
     run_codexbar(
         &[
             "cost",
@@ -129,6 +147,27 @@ pub fn cost(provider: &str, timeout: Option<Duration>) -> Result<Output, SpawnEr
         ],
         timeout,
     )
+}
+
+/// Fabricate an `Output` whose `stdout` is shaped exactly like codexbar's
+/// real AuthMissing response (see `docs/cli-reference/usage-codex-cli.json`).
+/// The downstream parse → merge pipeline then classifies it as
+/// `ProviderHealth::AuthMissing` with zero subprocess invocations, so the
+/// `a: show all` panel surfaces the same "run the provider CLI login"
+/// hint the user would have gotten from the real call.
+fn synthetic_auth_missing_output(provider: &str, source: &str) -> Output {
+    // ExitStatus::from_raw on Unix: 0x0100 == exit code 1, matching the
+    // real codexbar behavior when it emits an error record on stdout.
+    let status = ExitStatus::from_raw(0x0100);
+    let body = format!(
+        r#"[{{"error":{{"code":1,"kind":"provider","message":"{provider} authentication required; run the provider CLI login"}},"provider":"{provider}","source":"{source}"}}]"#
+    );
+    Output {
+        status,
+        stdout: body.into_bytes(),
+        stderr: Vec::new(),
+        elapsed: Duration::ZERO,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +267,60 @@ mod tests {
         match err {
             SpawnError::NotFound(_) => {}
             other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn synthetic_auth_missing_output_is_classified_auth_missing_downstream() {
+        // Round-trip: the fake stdout we emit on preflight-fail must flow
+        // through parse::parse_usage + merge::classify_error / build_snapshot
+        // and land as ProviderHealth::AuthMissing. Otherwise the rest of
+        // the app wouldn't know to pause the worker.
+        use crate::merge::{ProviderHealth, ProviderId, build_snapshot};
+        use crate::parse::parse_usage;
+        use chrono::{NaiveDate, Utc};
+
+        let out = synthetic_auth_missing_output("codex", "cli");
+        assert!(!out.status.success(), "synthetic output signals failure");
+        let records = parse_usage(&out.stdout).expect("parses cleanly");
+        assert_eq!(records.len(), 1);
+        let today: NaiveDate = "2026-04-18".parse().unwrap();
+        let snap = build_snapshot(
+            ProviderId::new("codex"),
+            &records,
+            None,
+            today,
+            Utc::now(),
+        );
+        assert!(
+            matches!(snap.health, ProviderHealth::AuthMissing),
+            "got {:?}",
+            snap.health
+        );
+    }
+
+    #[test]
+    fn usage_cli_preflight_short_circuits_codex_with_no_auth_json() {
+        // Redirect CODEX_HOME to an empty tempdir so `auth.json` is
+        // missing. usage_cli MUST skip the subprocess and return the
+        // synthetic AuthMissing output.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: unit tests in one module run single-threaded against
+        // these env vars.
+        unsafe {
+            std::env::set_var("CODEX_HOME", tmp.path());
+        }
+        let out = usage_cli("codex", None).expect("preflight never errors");
+        // The key signal: elapsed is effectively zero because we never
+        // spawned codexbar. A real run here takes ~15 seconds.
+        assert!(out.elapsed < Duration::from_millis(100));
+        assert!(
+            std::str::from_utf8(&out.stdout)
+                .unwrap()
+                .contains("authentication required")
+        );
+        unsafe {
+            std::env::remove_var("CODEX_HOME");
         }
     }
 }
