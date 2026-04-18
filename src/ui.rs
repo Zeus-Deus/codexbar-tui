@@ -20,15 +20,20 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::merge::{ModelShare, ProviderHealth, ProviderId, ProviderSnapshot, QuotaBar};
+use crate::merge::{ProviderHealth, ProviderId, ProviderSnapshot, QuotaBar};
 use crate::state::AppState;
 
-/// Per-provider row height: 1 line top border (carries the title), 1 content
-/// line, 1 line bottom border. 16 providers at 3 lines each = 48 lines,
-/// which fits on a standard Omarchy terminal (50+ rows). On shorter
-/// terminals the bottom providers get clipped by ratatui — acceptable for
-/// v1; the user can trim via `hidden_providers` in config.toml.
-const PROVIDER_ROW_HEIGHT: u16 = 3;
+/// Row height for a provider whose snapshot is in an error / loading state
+/// (1 line top border + 1 content line + 1 line bottom border).
+const ERROR_ROW_HEIGHT: u16 = 3;
+
+/// Row height for a healthy provider is dynamic: 2 border lines + one line
+/// per quota window (stacked vertically) + 1 stats line with cost + top
+/// model. This helper captures the formula in one place.
+fn healthy_row_height(window_count: usize) -> u16 {
+    // 1 top border + N bar lines (min 1) + 1 stats line + 1 bottom border.
+    2 + window_count.max(1) as u16 + 1
+}
 
 pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
     let size = f.area();
@@ -50,9 +55,11 @@ pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
     } else if visible.is_empty() {
         draw_all_hidden_state(f, body, state.providers.len(), state.show_all);
     } else {
+        // Heights are per-provider: healthy rows grow to fit N stacked bars
+        // + a stats line; error/loading rows stay compact at 3 lines.
         let constraints: Vec<Constraint> = visible
             .iter()
-            .map(|_| Constraint::Length(PROVIDER_ROW_HEIGHT))
+            .map(|p| Constraint::Length(row_height_for(state.snapshot(p))))
             .collect();
         let rows = Layout::default()
             .direction(Direction::Vertical)
@@ -64,6 +71,15 @@ pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
     }
 
     draw_footer(f, footer, state, hidden);
+}
+
+/// Row height the block needs for this provider. Healthy snapshots grow
+/// with their window count; anything else gets the compact 3-line layout.
+fn row_height_for(snap: Option<&ProviderSnapshot>) -> u16 {
+    match snap {
+        Some(s) if matches!(s.health, ProviderHealth::Ok) => healthy_row_height(s.windows.len()),
+        _ => ERROR_ROW_HEIGHT,
+    }
 }
 
 /// Decide whether a provider panel should be visible in the current mode.
@@ -199,22 +215,20 @@ fn draw_provider_row(
         return;
     }
 
-    // Healthy row: horizontal split into bars | cost | top model.
-    //   - bars: take whatever's left after the two right-hand fixed columns.
-    //   - cost: compact "Today $x.xx   30d $y.yy" stamp.
-    //   - top model: "claude-haiku-4-5  100%  $84.76".
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
+    // Healthy row — inner is `windows.len() + 1` lines tall (see
+    // healthy_row_height). Stack one full-width bar per line at the top,
+    // then a single stats line at the bottom for cost + top model.
+    let bar_count = snap.windows.len().max(1);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(30),     // bars -- greedy
-            Constraint::Length(26),  // cost
-            Constraint::Length(34),  // top model
+            Constraint::Length(bar_count as u16), // one line per bar
+            Constraint::Length(1),                // stats line
         ])
         .split(inner);
 
-    draw_inline_bars(f, cols[0], &snap.windows, now);
-    draw_inline_cost(f, cols[1], snap);
-    draw_inline_top_model(f, cols[2], &snap.top_models_today);
+    draw_stacked_bars(f, rows[0], &snap.windows, now);
+    draw_stats_line(f, rows[1], snap);
 }
 
 fn render_single_line(f: &mut Frame, area: Rect, line: Line<'_>) {
@@ -281,65 +295,81 @@ fn health_line<'a>(health: &'a ProviderHealth, last_error: Option<&'a str>) -> L
 }
 
 // ---------------------------------------------------------------------------
-// Inline content: bars / cost / top model
+// Stacked bars + stats line
 // ---------------------------------------------------------------------------
 
-fn draw_inline_bars(f: &mut Frame, area: Rect, bars: &[QuotaBar], now: DateTime<Utc>) {
+/// Render one bar per line, full-width, stacked top-to-bottom inside
+/// `area`. Each bar gets roughly `area.height / bars.len()` vertical space
+/// (1 line each at the sizes we use). `now` is threaded through so the
+/// optional countdown text stays accurate frame-to-frame.
+fn draw_stacked_bars(f: &mut Frame, area: Rect, bars: &[QuotaBar], now: DateTime<Utc>) {
     if bars.is_empty() {
         render_single_line(
             f,
             area,
             Line::from(Span::styled(
-                " no quota windows reported",
+                "no quota windows reported",
                 Style::default().fg(Color::DarkGray),
             )),
         );
         return;
     }
 
-    // Budget roughly equal space to each bar within the bars column. A
-    // "slot" is label (~7) + gauge + pct% + optional countdown.
-    let bar_slots = Layout::default()
-        .direction(Direction::Horizontal)
+    // One line per bar.
+    let slots = Layout::default()
+        .direction(Direction::Vertical)
         .constraints(
-            std::iter::repeat_n(Constraint::Ratio(1, bars.len() as u32), bars.len())
-                .collect::<Vec<_>>(),
+            std::iter::repeat_n(Constraint::Length(1), bars.len()).collect::<Vec<_>>(),
         )
         .split(area);
 
-    for (slot, bar) in bar_slots.iter().zip(bars.iter()) {
-        let pct = bar.used_percent.min(100);
-        // Gauge width: whatever's left after label + "  12% " + optional
-        // countdown. Keep a floor of 4 characters so something always
-        // renders even in a tight column.
-        let total = slot.width as usize;
-        let countdown = countdown_text(bar.resets_at, now);
-        let countdown_len = countdown.as_deref().map(|s| s.len() + 1).unwrap_or(0);
-        let overhead = bar.window_label.chars().count() + 1 + 5 + countdown_len + 2;
-        let gauge_width = total.saturating_sub(overhead).max(4);
-
-        let mut spans = vec![
-            Span::styled(
-                bar.window_label.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                text_gauge(pct, gauge_width),
-                Style::default().fg(bar_color(pct)),
-            ),
-            Span::raw(" "),
-            Span::styled(
-                format!("{pct:>3}%"),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-        ];
-        if let Some(cd) = countdown {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(cd, Style::default().fg(Color::Cyan)));
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)), *slot);
+    for (slot, bar) in slots.iter().zip(bars.iter()) {
+        draw_bar_line(f, *slot, bar, now);
     }
+}
+
+/// Render a single quota bar on one line across `area`'s full width:
+/// `label  [gauge]  pct%  countdown`. The gauge flexes to fill whatever
+/// space is left after the fixed-width label / pct / optional countdown.
+fn draw_bar_line(f: &mut Frame, area: Rect, bar: &QuotaBar, now: DateTime<Utc>) {
+    let pct = bar.used_percent.min(100);
+    let countdown = countdown_text(bar.resets_at, now);
+
+    // Fixed widths for the non-gauge bits. Keep the label column narrow
+    // (8 cols fits "weekly " comfortably) so the gauge gets most of the
+    // row. pct is always 4 chars ("100%"). Countdown, if present, we
+    // reserve its exact length + a leading space.
+    const LABEL_COL: usize = 8;
+    const PCT_COL: usize = 4;
+    let countdown_len = countdown.as_deref().map(|s| s.chars().count() + 1).unwrap_or(0);
+
+    let total = area.width as usize;
+    let overhead = LABEL_COL + 1 /*sp*/ + PCT_COL + 1 /*sp*/ + countdown_len;
+    let gauge_width = total.saturating_sub(overhead).max(4);
+
+    let mut label = bar.window_label.clone();
+    if label.chars().count() > LABEL_COL - 1 {
+        label = label.chars().take(LABEL_COL - 1).collect::<String>();
+    }
+    let label_padded = format!("{label:<LABEL_COL$}");
+
+    let mut spans = vec![
+        Span::styled(label_padded, Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            text_gauge(pct, gauge_width),
+            Style::default().fg(bar_color(pct)),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("{pct:>3}%"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(cd) = countdown {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(cd, Style::default().fg(Color::Cyan)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Unicode-block text gauge. `pct` is 0..=100; width is the number of block
@@ -360,7 +390,10 @@ fn text_gauge(pct: u8, width: usize) -> String {
     s
 }
 
-fn draw_inline_cost(f: &mut Frame, area: Rect, snap: &ProviderSnapshot) {
+/// Single bottom line per provider: `Today $x.xx   30d $y.yy   top_model pct% $cost`.
+/// Everything inline; nothing else competes for width because this line
+/// is below the stacked bars rather than beside them.
+fn draw_stats_line(f: &mut Frame, area: Rect, snap: &ProviderSnapshot) {
     let today = snap
         .cost_today
         .map(|c| format!("${c:.2}"))
@@ -369,40 +402,35 @@ fn draw_inline_cost(f: &mut Frame, area: Rect, snap: &ProviderSnapshot) {
         .cost_30d
         .map(|c| format!("${c:.2}"))
         .unwrap_or_else(|| "—".into());
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled("Today ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(today, Style::default().fg(Color::Cyan)),
-        Span::raw("  "),
+        Span::raw("   "),
         Span::styled("30d ", Style::default().add_modifier(Modifier::BOLD)),
         Span::styled(month, Style::default().fg(Color::Cyan)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
-}
-
-fn draw_inline_top_model(f: &mut Frame, area: Rect, models: &[ModelShare]) {
-    let line = match models.first() {
-        Some(m) => Line::from(vec![
-            Span::styled(
-                truncate(&m.model, 18).to_string(),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{:>3}%", m.percent_of_day),
-                Style::default().fg(Color::Cyan),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("${:.2}", m.cost),
-                Style::default().fg(Color::Green),
-            ),
-        ]),
-        None => Line::from(Span::styled(
-            "(no models today)",
+    ];
+    if let Some(m) = snap.top_models_today.first() {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            "top ",
             Style::default().fg(Color::DarkGray),
-        )),
-    };
-    f.render_widget(Paragraph::new(line), area);
+        ));
+        spans.push(Span::styled(
+            truncate(&m.model, 22).to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("{:>3}%", m.percent_of_day),
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("${:.2}", m.cost),
+            Style::default().fg(Color::Green),
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn bar_color(pct: u8) -> Color {
