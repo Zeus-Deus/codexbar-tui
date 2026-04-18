@@ -271,6 +271,13 @@ fn run_event_loop(
                             broadcast_refresh(handles);
                             state.set_status("refreshing…");
                         }
+                        KeyCode::Char('a') => {
+                            state.toggle_show_all();
+                            // Drop any sticky startup status so the footer's
+                            // left side stops obscuring the mode indicator
+                            // the moment the user engages with the toggle.
+                            state.clear_status();
+                        }
                         _ => {}
                     }
                 }

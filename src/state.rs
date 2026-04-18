@@ -61,6 +61,12 @@ pub struct AppState {
     /// returned nothing vs. everything filtered out). The renderer reads
     /// this INSTEAD of a hardcoded empty-state string.
     pub empty_reason: Option<String>,
+    /// When `true`, the renderer displays every provider regardless of
+    /// health. When `false` (default), only providers that are healthy or
+    /// still waiting for their first poll are rendered; error-state
+    /// providers are hidden so the main screen only shows actionable data.
+    /// Toggled by the `a` key in the event loop.
+    pub show_all: bool,
     pub should_quit: bool,
 }
 
@@ -72,12 +78,17 @@ impl AppState {
             snapshots: HashMap::new(),
             status_line: None,
             empty_reason: None,
+            show_all: false,
             should_quit: false,
         }
     }
 
     pub fn set_empty_reason<S: Into<String>>(&mut self, msg: S) {
         self.empty_reason = Some(msg.into());
+    }
+
+    pub fn toggle_show_all(&mut self) {
+        self.show_all = !self.show_all;
     }
 
     /// Write a fresh snapshot in, replacing any prior one for the provider.
@@ -157,5 +168,18 @@ mod tests {
         assert_eq!(s.status_line.as_deref(), Some("refreshing"));
         s.clear_status();
         assert!(s.status_line.is_none());
+    }
+
+    #[test]
+    fn show_all_defaults_off_and_toggles() {
+        let mut s = AppState::new(
+            vec![ProviderId::new("claude")],
+            RefreshIntervals::default(),
+        );
+        assert!(!s.show_all, "default must be filtered view");
+        s.toggle_show_all();
+        assert!(s.show_all);
+        s.toggle_show_all();
+        assert!(!s.show_all);
     }
 }

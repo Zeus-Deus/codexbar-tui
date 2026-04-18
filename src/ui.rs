@@ -34,11 +34,23 @@ pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
     let size = f.area();
     let [body, footer] = vertical_split(size, [Constraint::Min(1), Constraint::Length(1)]);
 
+    // Filter to the providers the user should see right now:
+    //   * show_all on  → every configured provider
+    //   * show_all off → only Ok / not-yet-polled (hides errors + auth-missing
+    //                    so the main screen only contains actionable data).
+    let visible: Vec<&ProviderId> = state
+        .providers
+        .iter()
+        .filter(|p| is_visible(state.snapshot(p), state.show_all))
+        .collect();
+    let hidden = state.providers.len().saturating_sub(visible.len());
+
     if state.providers.is_empty() {
         draw_empty_state(f, body, state.empty_reason.as_deref());
+    } else if visible.is_empty() {
+        draw_all_hidden_state(f, body, state.providers.len(), state.show_all);
     } else {
-        let constraints: Vec<Constraint> = state
-            .providers
+        let constraints: Vec<Constraint> = visible
             .iter()
             .map(|_| Constraint::Length(PROVIDER_ROW_HEIGHT))
             .collect();
@@ -46,12 +58,66 @@ pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(body);
-        for (slot, provider) in rows.iter().zip(state.providers.iter()) {
+        for (slot, provider) in rows.iter().zip(visible.iter()) {
             draw_provider_row(f, *slot, provider, state.snapshot(provider), now);
         }
     }
 
-    draw_footer(f, footer, state);
+    draw_footer(f, footer, state, hidden);
+}
+
+/// Decide whether a provider panel should be visible in the current mode.
+///
+/// Default (`show_all == false`):
+///   * `None` snapshot → show (transient "waiting for first poll…" state;
+///     hiding during startup would make the screen flash).
+///   * `Ok` → show.
+///   * any other health → hide.
+///
+/// `show_all == true` always shows.
+fn is_visible(snap: Option<&ProviderSnapshot>, show_all: bool) -> bool {
+    if show_all {
+        return true;
+    }
+    match snap {
+        None => true,
+        Some(s) => matches!(s.health, ProviderHealth::Ok),
+    }
+}
+
+/// Body message shown when every configured provider is filtered out —
+/// typical for a fresh Linux install where only Claude (or nothing) is
+/// actually authed.
+fn draw_all_hidden_state(f: &mut Frame, area: Rect, total: usize, show_all: bool) {
+    let lines: Vec<Line> = if show_all {
+        vec![
+            Line::from(Span::styled(
+                "No providers are healthy yet.",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from("Resolve the per-panel errors above to see data here."),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "No working providers.",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(format!(
+                "codexbar reports {total} providers configured, but none returned data."
+            )),
+            Line::from(Span::styled(
+                "Press 'a' to see all of them with their auth/error state.",
+                Style::default().fg(Color::Cyan),
+            )),
+        ]
+    };
+    let p = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, area);
 }
 
 /// Body-level empty-state renderer. Called when AppState.providers is empty.
@@ -397,17 +463,43 @@ fn fetched_ago(snap: &ProviderSnapshot, now: DateTime<Utc>) -> String {
 // Global footer (below all panels)
 // ---------------------------------------------------------------------------
 
-fn draw_footer(f: &mut Frame, area: Rect, state: &AppState) {
-    let msg = state
+fn draw_footer(f: &mut Frame, area: Rect, state: &AppState, hidden: usize) {
+    // Left half: sticky status line from AppState, or the "q / r" hint
+    // when nothing is status-worthy. Right half: mode indicator for the
+    // `a` toggle so the user can always see how many panels are hidden.
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(36)])
+        .split(area);
+
+    let status = state
         .status_line
         .clone()
         .unwrap_or_else(|| "q: quit   r: refresh".to_string());
-    let p = Paragraph::new(Line::from(Span::styled(
-        msg,
-        Style::default().fg(Color::DarkGray),
-    )))
-    .alignment(Alignment::Left);
-    f.render_widget(p, area);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            status,
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Left),
+        cols[0],
+    );
+
+    let mode = if state.show_all {
+        "a: show working only".to_string()
+    } else if hidden > 0 {
+        format!("{hidden} hidden   a: show all")
+    } else {
+        "a: show all".to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            mode,
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Right),
+        cols[1],
+    );
 }
 
 fn fmt_utc(t: DateTime<Utc>) -> String {
@@ -471,6 +563,61 @@ mod tests {
         let g = text_gauge(33, 10);
         let inside: String = g.chars().filter(|&c| c == '█' || c == '░').collect();
         assert_eq!(inside.chars().count(), 10);
+    }
+
+    fn snap_with(health: ProviderHealth) -> ProviderSnapshot {
+        ProviderSnapshot {
+            provider: ProviderId::new("test"),
+            fetched_at: Utc::now(),
+            upstream_at: None,
+            health,
+            windows: Vec::new(),
+            cost_today: None,
+            cost_30d: None,
+            top_models_today: Vec::new(),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn is_visible_default_hides_errors_shows_ok_and_loading() {
+        // Default mode (show_all = false)
+        assert!(is_visible(None, false), "loading rows stay visible during boot");
+        assert!(is_visible(Some(&snap_with(ProviderHealth::Ok)), false));
+        assert!(!is_visible(Some(&snap_with(ProviderHealth::AuthMissing)), false));
+        assert!(!is_visible(
+            Some(&snap_with(ProviderHealth::NotSupportedOnLinux)),
+            false
+        ));
+        assert!(!is_visible(
+            Some(&snap_with(ProviderHealth::Error {
+                message: "boom".into()
+            })),
+            false
+        ));
+        assert!(!is_visible(
+            Some(&snap_with(ProviderHealth::Stale {
+                since: Utc::now()
+            })),
+            false
+        ));
+    }
+
+    #[test]
+    fn is_visible_show_all_keeps_everything() {
+        assert!(is_visible(None, true));
+        assert!(is_visible(Some(&snap_with(ProviderHealth::Ok)), true));
+        assert!(is_visible(Some(&snap_with(ProviderHealth::AuthMissing)), true));
+        assert!(is_visible(
+            Some(&snap_with(ProviderHealth::NotSupportedOnLinux)),
+            true
+        ));
+        assert!(is_visible(
+            Some(&snap_with(ProviderHealth::Error {
+                message: "x".into()
+            })),
+            true
+        ));
     }
 
     #[test]
