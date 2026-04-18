@@ -2,6 +2,7 @@ mod config;
 mod merge;
 mod parse;
 mod poll;
+mod providers;
 mod spawn;
 mod state;
 mod ui;
@@ -64,10 +65,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// clean read ("used"), a parse / spawn failure we can degrade past, or the
 /// empty-list case.
 enum ProviderSource {
-    /// N providers, post-denylist. Report the raw dump size so the status
-    /// line can say "12 enabled, 2 hidden -> 10 shown".
-    Used { dumped: usize, hidden: usize },
-    /// codexbar reachable but the dump had no enabled providers at all.
+    /// Post-filter provider set. `dumped` is the raw count from codexbar;
+    /// `skipped_web_only` is how many we dropped via `providers::LINUX_WEB_ONLY`;
+    /// `hidden` is how many the user denied in `hidden_providers`.
+    Used {
+        dumped: usize,
+        skipped_web_only: usize,
+        hidden: usize,
+    },
+    /// codexbar reachable but the dump contained zero provider entries.
     DumpEmpty,
     /// codexbar missing from PATH or the dump failed to parse; we fall
     /// back to an empty provider set and let the user fix it.
@@ -83,16 +89,37 @@ fn resolve_providers(cfg: &Config) -> (Vec<ProviderId>, ProviderSource) {
             Ok(dump) => {
                 let dumped_ids = dump.ids();
                 let dumped = dumped_ids.len();
+                // Two-stage filter: (1) drop providers whose only codexbar
+                // source mode is web (macOS-gated in v0.20); (2) drop
+                // anything in the user's hidden_providers denylist.
+                let mut skipped_web_only = 0usize;
+                let mut hidden = 0usize;
                 let providers: Vec<ProviderId> = dumped_ids
                     .into_iter()
-                    .filter(|id| !cfg.is_hidden(id))
+                    .filter(|id| {
+                        if providers::is_linux_web_only(id) {
+                            skipped_web_only += 1;
+                            return false;
+                        }
+                        if cfg.is_hidden(id) {
+                            hidden += 1;
+                            return false;
+                        }
+                        true
+                    })
                     .map(ProviderId::new)
                     .collect();
-                let hidden = dumped.saturating_sub(providers.len());
-                if providers.is_empty() && dumped == 0 {
+                if dumped == 0 {
                     (providers, ProviderSource::DumpEmpty)
                 } else {
-                    (providers, ProviderSource::Used { dumped, hidden })
+                    (
+                        providers,
+                        ProviderSource::Used {
+                            dumped,
+                            skipped_web_only,
+                            hidden,
+                        },
+                    )
                 }
             }
             Err(e) => (
@@ -121,10 +148,15 @@ fn startup_status(
         None => "config: default (no ~/.config/codexbar-tui/config.toml)".to_string(),
     };
     let provider_part = match source {
-        ProviderSource::Used { dumped, hidden } if *hidden > 0 => {
+        ProviderSource::Used {
+            dumped,
+            skipped_web_only,
+            hidden,
+        } if *skipped_web_only > 0 || *hidden > 0 => {
             format!(
-                "  providers: {} enabled, {} hidden -> {} shown",
+                "  providers: {} listed, {} web-only skipped, {} hidden -> {} shown",
                 dumped,
+                skipped_web_only,
                 hidden,
                 providers.len()
             )
@@ -133,7 +165,7 @@ fn startup_status(
             format!("  providers: {dumped} from codexbar config dump")
         }
         ProviderSource::DumpEmpty => {
-            "  providers: codexbar config dump has none enabled".to_string()
+            "  providers: codexbar config dump returned no entries".to_string()
         }
         ProviderSource::Unavailable { reason } => format!("  providers: {reason}"),
     };
