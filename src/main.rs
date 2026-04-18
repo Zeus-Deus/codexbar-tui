@@ -81,7 +81,7 @@ fn resolve_providers(cfg: &Config) -> (Vec<ProviderId>, ProviderSource) {
     ) {
         Ok(out) => match parse::parse_config_dump(&out.stdout) {
             Ok(dump) => {
-                let dumped_ids = dump.enabled_ids();
+                let dumped_ids = dump.ids();
                 let dumped = dumped_ids.len();
                 let providers: Vec<ProviderId> = dumped_ids
                     .into_iter()

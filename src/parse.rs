@@ -158,14 +158,17 @@ pub struct ConfigDumpProvider {
 }
 
 impl ConfigDump {
-    /// IDs of providers the user has toggled on in `~/.codexbar/config.json`,
-    /// in the order upstream writes them (which is the order we render panels).
-    pub fn enabled_ids(&self) -> Vec<String> {
-        self.providers
-            .iter()
-            .filter(|p| p.enabled)
-            .map(|p| p.id.clone())
-            .collect()
+    /// All provider IDs the dump carries, in upstream's emit order (which
+    /// is the order we render panels).
+    ///
+    /// We intentionally ignore `ConfigDumpProvider.enabled`: that flag is a
+    /// macOS-GUI convention (the CodexBar menu bar has checkboxes that
+    /// toggle it). On fresh Linux installs every entry defaults to `false`
+    /// — filtering on it would show nothing by default. Per-user hiding
+    /// belongs in our own `hidden_providers` denylist; Linux-unsupported
+    /// providers are filtered via `providers::LINUX_WEB_ONLY`.
+    pub fn ids(&self) -> Vec<String> {
+        self.providers.iter().map(|p| p.id.clone()).collect()
     }
 }
 
@@ -339,27 +342,32 @@ mod tests {
     }
 
     #[test]
-    fn config_dump_is_parsed() {
+    fn config_dump_returns_every_listed_provider() {
         let c = parse_config_dump(CONFIG_DUMP).unwrap();
         assert_eq!(c.version, 1);
         assert!(!c.providers.is_empty());
-        // On the audit fixture, only `codex` is enabled.
-        let ids = c.enabled_ids();
-        assert_eq!(ids, vec!["codex".to_string()]);
-        // Sanity: claude appears but is disabled.
-        assert!(c.providers.iter().any(|p| p.id == "claude" && !p.enabled));
+        // Every provider in the dump is returned, regardless of the
+        // `enabled` flag. On this v0.20 fixture only codex is flagged
+        // enabled=true, but the TUI still shows all of them (after the
+        // Linux-skip list + user denylist are applied elsewhere).
+        let ids = c.ids();
+        assert!(ids.contains(&"codex".to_string()));
+        assert!(ids.contains(&"claude".to_string()));
+        assert!(ids.contains(&"gemini".to_string()));
+        assert_eq!(ids.len(), c.providers.len());
     }
 
     #[test]
-    fn config_dump_preserves_order() {
-        // Synthetic dump: the enabled order must match the order we feed in.
+    fn config_dump_preserves_order_regardless_of_enabled_flag() {
+        // Two of these are flagged enabled=false; ids() must still return
+        // all four in input order.
         let body = br#"{"version":1,"providers":[
             {"id":"codex","enabled":true},
             {"id":"claude","enabled":false},
-            {"id":"gemini","enabled":true},
+            {"id":"gemini","enabled":false},
             {"id":"warp","enabled":true}
         ]}"#;
         let c = parse_config_dump(body).unwrap();
-        assert_eq!(c.enabled_ids(), vec!["codex", "gemini", "warp"]);
+        assert_eq!(c.ids(), vec!["codex", "claude", "gemini", "warp"]);
     }
 }
