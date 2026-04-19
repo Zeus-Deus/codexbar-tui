@@ -14,7 +14,7 @@
 //! adding fields does not break us.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -38,7 +38,7 @@ pub enum ParseError {
 /// One record emitted by `codexbar usage`. Both success and error paths are
 /// carried here — `usage`/`status`/`version` are absent on error; `error` is
 /// absent on success.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UsageRecord {
     pub provider: String,
     pub source: String,
@@ -52,7 +52,7 @@ pub struct UsageRecord {
     pub error: Option<ErrorBlock>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UsageBlock {
     pub identity: Identity,
     #[serde(default)]
@@ -65,13 +65,13 @@ pub struct UsageBlock {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Identity {
     #[serde(rename = "providerID")]
     pub provider_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Window {
     #[serde(default, rename = "usedPercent")]
     pub used_percent: Option<u8>,
@@ -83,7 +83,7 @@ pub struct Window {
     pub reset_description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StatusBlock {
     pub indicator: String,
     pub description: String,
@@ -92,7 +92,7 @@ pub struct StatusBlock {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ErrorBlock {
     pub code: i32,
     pub kind: String,
@@ -103,7 +103,7 @@ pub struct ErrorBlock {
 // `codexbar cost` records
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CostRecord {
     pub provider: String,
     pub source: String,
@@ -113,7 +113,7 @@ pub struct CostRecord {
     pub daily: Vec<DailyCost>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DailyCost {
     pub date: NaiveDate,
     #[serde(default, rename = "inputTokens")]
@@ -140,7 +140,7 @@ pub struct DailyCost {
     pub model_breakdowns: Vec<ModelBreakdown>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelBreakdown {
     #[serde(rename = "modelName")]
     pub model_name: String,
@@ -157,7 +157,7 @@ pub struct ModelBreakdown {
 
 /// Shape of `codexbar config dump` stdout. Single top-level object, no
 /// arrays. See docs/cli-reference/config-dump-pretty.txt.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConfigDump {
     #[serde(default)]
     pub version: u32,
@@ -165,7 +165,7 @@ pub struct ConfigDump {
     pub providers: Vec<ConfigDumpProvider>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ConfigDumpProvider {
     pub id: String,
     #[serde(default)]

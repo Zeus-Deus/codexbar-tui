@@ -1,3 +1,4 @@
+mod cache;
 mod config;
 mod merge;
 mod parse;
@@ -7,11 +8,12 @@ mod spawn;
 mod state;
 mod ui;
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
@@ -32,10 +34,43 @@ const RENDER_TICK: Duration = Duration::from_millis(1000);
 /// Per-provider cache of the latest successful records, kept on the main
 /// thread so we can rebuild a ProviderSnapshot whenever either the usage
 /// records or the cost record changes.
+///
+/// Each half carries its own `fetched_at` because usage and cost are
+/// polled on independent cadences (60 s / 300 s by default) and can be
+/// sourced from different origins (a fresh poll vs. the on-disk cache we
+/// hydrate at startup). `rebuild` stamps the ProviderSnapshot with the
+/// **later** of the two so the UI's "fetched Xm ago" line tracks the
+/// freshest piece of data the panel shows.
 #[derive(Default)]
 struct ProviderCache {
-    usage: Option<Vec<UsageRecord>>,
-    cost: Option<CostRecord>,
+    usage: Option<CachedUsage>,
+    cost: Option<CachedCost>,
+}
+
+#[derive(Clone)]
+struct CachedUsage {
+    fetched_at: DateTime<Utc>,
+    records: Vec<UsageRecord>,
+}
+
+#[derive(Clone)]
+struct CachedCost {
+    fetched_at: DateTime<Utc>,
+    record: Option<CostRecord>,
+}
+
+impl ProviderCache {
+    /// Snapshot's `fetched_at` is the newest of whichever halves exist.
+    /// `None` only when both halves are empty (brand-new cache entry),
+    /// in which case `rebuild` skips — we have nothing to render yet.
+    fn latest_fetched_at(&self) -> Option<DateTime<Utc>> {
+        match (&self.usage, &self.cost) {
+            (Some(u), Some(c)) => Some(u.fetched_at.max(c.fetched_at)),
+            (Some(u), None) => Some(u.fetched_at),
+            (None, Some(c)) => Some(c.fetched_at),
+            (None, None) => None,
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -55,10 +90,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.set_empty_reason(empty_state_message(&provider_source));
     }
 
+    // Hydrate the main-thread cache from disk BEFORE starting workers and
+    // setting up the terminal. `cache::load` is infallible (failure paths
+    // collapse to an empty cache), so the only cost is a single small
+    // stat + read + JSON parse — negligible compared to the ~15 s first
+    // codexbar poll it saves us from having to wait for.
+    let disk_cache = cache::load();
+
     let (rx, handles) = start_workers(&providers, cfg.intervals.usage, cfg.intervals.cost);
 
     let mut terminal = setup_terminal()?;
-    let loop_result = run_event_loop(&mut terminal, &mut state, rx, &handles);
+    let loop_result = run_event_loop(&mut terminal, &mut state, rx, &handles, disk_cache);
     restore_terminal(&mut terminal)?;
 
     shutdown(handles);
@@ -225,12 +267,29 @@ fn run_event_loop(
     state: &mut AppState,
     rx: Receiver<PollEvent>,
     handles: &[WorkerHandle],
+    disk: cache::CacheFile,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut caches: std::collections::HashMap<ProviderId, ProviderCache> = state
+    // Seed the in-memory cache from whatever we had on disk. Unknown
+    // providers in the disk file (e.g. user disabled one since last
+    // launch) are silently ignored — `providers.iter()` drives the key
+    // set, not the disk file.
+    let mut caches: HashMap<ProviderId, ProviderCache> = state
         .providers
         .iter()
-        .map(|p| (p.clone(), ProviderCache::default()))
+        .map(|p| {
+            let entry = disk.providers.get(p.cli_id()).cloned().unwrap_or_default();
+            (p.clone(), provider_cache_from_disk(entry))
+        })
         .collect();
+
+    // Pre-render snapshots for every provider that has ANY cached data.
+    // This is the whole point of the disk cache: the first `terminal.draw`
+    // below will show real usage bars / costs instead of "waiting for
+    // first poll…". Providers with no cache keep their None snapshot and
+    // fall back to the loading placeholder, same as before.
+    for p in state.providers.clone() {
+        rebuild(&p, state, &caches);
+    }
 
     let mut last_tick = Instant::now();
     loop {
@@ -294,33 +353,90 @@ fn run_event_loop(
 fn apply_event(
     ev: PollEvent,
     state: &mut AppState,
-    caches: &mut std::collections::HashMap<ProviderId, ProviderCache>,
+    caches: &mut HashMap<ProviderId, ProviderCache>,
     handles: &[WorkerHandle],
 ) {
     match ev {
         PollEvent::Usage { provider, records } => {
-            caches.entry(provider.clone()).or_default().usage = Some(records);
+            caches.entry(provider.clone()).or_default().usage = Some(CachedUsage {
+                fetched_at: Utc::now(),
+                records,
+            });
             rebuild(&provider, state, caches);
             maybe_pause_after(&provider, Command::Usage, state, handles);
             state.clear_status();
+            // Persist AFTER rebuild so the new data is definitely in
+            // `caches` when we dump it. Write is best-effort; disk errors
+            // are swallowed (see persist_cache).
+            persist_cache(caches);
         }
         PollEvent::Cost { provider, record } => {
-            caches.entry(provider.clone()).or_default().cost = record;
+            caches.entry(provider.clone()).or_default().cost = Some(CachedCost {
+                fetched_at: Utc::now(),
+                record,
+            });
             rebuild(&provider, state, caches);
             maybe_pause_after(&provider, Command::Cost, state, handles);
             state.clear_status();
+            persist_cache(caches);
         }
         PollEvent::Error {
             provider,
             command,
             message,
         } => {
+            // Errors don't mutate the cache, so there's no reason to
+            // rewrite the file on this branch — the last known good
+            // values stay on disk exactly as they were.
             let which = match command {
                 Command::Usage => "usage",
                 Command::Cost => "cost",
             };
             state.set_status(format!("{} {}: {message}", provider.label(), which));
         }
+    }
+}
+
+/// Translate the in-memory cache into the on-disk envelope and write it.
+/// Failures are swallowed: the cache is a performance aid, not state the
+/// app depends on. Worst case the next launch shows "waiting for first
+/// poll…" placeholders, exactly like before this module existed.
+fn persist_cache(caches: &HashMap<ProviderId, ProviderCache>) {
+    let mut providers: std::collections::HashMap<String, cache::ProviderEntry> =
+        std::collections::HashMap::with_capacity(caches.len());
+    for (id, entry) in caches {
+        providers.insert(id.cli_id().to_string(), provider_cache_to_disk(entry));
+    }
+    let file = cache::CacheFile {
+        version: cache::CACHE_VERSION,
+        providers,
+    };
+    let _ = cache::save(&file);
+}
+
+fn provider_cache_from_disk(entry: cache::ProviderEntry) -> ProviderCache {
+    ProviderCache {
+        usage: entry.usage.map(|u| CachedUsage {
+            fetched_at: u.fetched_at,
+            records: u.records,
+        }),
+        cost: entry.cost.map(|c| CachedCost {
+            fetched_at: c.fetched_at,
+            record: c.record,
+        }),
+    }
+}
+
+fn provider_cache_to_disk(entry: &ProviderCache) -> cache::ProviderEntry {
+    cache::ProviderEntry {
+        usage: entry.usage.as_ref().map(|u| cache::UsageEntry {
+            fetched_at: u.fetched_at,
+            records: u.records.clone(),
+        }),
+        cost: entry.cost.as_ref().map(|c| cache::CostEntry {
+            fetched_at: c.fetched_at,
+            record: c.record.clone(),
+        }),
     }
 }
 
@@ -356,20 +472,30 @@ fn maybe_pause_after(
 fn rebuild(
     provider: &ProviderId,
     state: &mut AppState,
-    caches: &std::collections::HashMap<ProviderId, ProviderCache>,
+    caches: &HashMap<ProviderId, ProviderCache>,
 ) {
-    let Some(cache) = caches.get(provider) else {
+    let Some(entry) = caches.get(provider) else {
         return;
     };
-    let Some(usage) = &cache.usage else {
+    let Some(usage) = &entry.usage else {
         return;
     };
-    let now = Utc::now();
+    // Snapshot timestamp = the newest piece of data it contains. That's
+    // usually `now` right after a live poll (both halves just updated)
+    // but on a cache-hydrated launch it's the original poll time from
+    // disk, so the UI's "fetched Xm ago" line correctly reports stale
+    // data as stale. Falling back to Utc::now() is defensive; with a
+    // Some(usage) above we always have at least one timestamp.
+    let fetched_at = entry.latest_fetched_at().unwrap_or_else(Utc::now);
     // IMPORTANT: DailyCost.date is bucketed by codexbar in local time (honors
     // $TZ; see docs/cli-reference/schema.md). Always ask for today in LOCAL
     // time here -- using Utc::now() would pick the wrong bucket whenever the
-    // user's local date differs from the UTC date (up to ~24h drift).
+    // user's local date differs from the UTC date (up to ~24h drift). We
+    // deliberately use *current* local date, not the cached fetched_at's
+    // date, so rehydrating a cache written yesterday still buckets into
+    // today's column correctly.
     let today: NaiveDate = chrono::Local::now().date_naive();
-    let snap = build_snapshot(provider.clone(), usage, cache.cost.as_ref(), today, now);
+    let cost_record = entry.cost.as_ref().and_then(|c| c.record.as_ref());
+    let snap = build_snapshot(provider.clone(), &usage.records, cost_record, today, fetched_at);
     state.apply_snapshot(snap);
 }
