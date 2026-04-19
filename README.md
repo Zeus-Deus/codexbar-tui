@@ -23,8 +23,19 @@ The setup script is idempotent — rerun it any time. It only touches two of
 - `~/.config/hypr/bindings.conf` &nbsp;→&nbsp; the `SUPER CTRL + U` bind
 - `~/.config/hypr/windows.conf` &nbsp;→&nbsp; the float/center/size windowrule
 
-Remove the marked blocks to uninstall the hotkey; `yay -R codexbar-tui`
-removes the binary.
+### Uninstall
+
+```bash
+codexbar-tui-remove-omarchy   # strips the hotkey + windowrule
+yay -R codexbar-tui           # removes the binary
+```
+
+The remove script only deletes the marked blocks — every other line in
+those two files is left byte-for-byte alone. It works through dotfile
+symlinks and preserves file permissions. Both scripts are covered by a
+52-assertion integration harness in [`tests/omarchy-hotkey.sh`](tests/omarchy-hotkey.sh)
+(round-trip, CRLF, UTF-8, symlinks, concurrent runs, 500-line realistic
+files, etc).
 
 ## Requirements
 

@@ -33,8 +33,15 @@ touch "${BINDINGS}" "${WINDOWS}"
 # --- strip any previous managed block ---------------------------------------
 # A managed block is: (optional preceding blank line) + marker + directive.
 # We drop all three so repeated runs stay diff-clean.
+#
+# Implementation note: we compute the stripped content to a sibling tmp
+# file and then *rewrite* the target in place via `cat >`. An `mv` would
+# replace the target's inode, which would (a) silently break users'
+# dotfile-managed symlinks and (b) reset file permissions. Shell `>`
+# truncates and writes through symlinks while preserving the mode.
 strip_marker() {
   local f="$1"
+  [[ -f "${f}" ]] || return 0
   grep -qF "${MARKER}" "${f}" || return 0
   awk -v m="${MARKER}" '
     { buf[++n] = $0 }
@@ -47,7 +54,9 @@ strip_marker() {
       }
       for (i = 1; i <= n; i++) if (!(i in drop)) print buf[i]
     }
-  ' "${f}" >"${f}.tmp" && mv "${f}.tmp" "${f}"
+  ' "${f}" >"${f}.tmp"
+  cat "${f}.tmp" >"${f}"
+  rm -f "${f}.tmp"
 }
 
 strip_marker "${BINDINGS}"

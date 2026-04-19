@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# codexbar-tui-remove-omarchy — undo what codexbar-tui-setup-omarchy did.
+#
+# Strips the marker-delimited blocks we wrote to
+#   ~/.config/hypr/bindings.conf
+#   ~/.config/hypr/windows.conf
+# and nothing else. Never touches anything outside those blocks. Safe to run
+# if the setup script was never run (it's a no-op in that case).
+
+set -euo pipefail
+
+BINDINGS="${HOME}/.config/hypr/bindings.conf"
+WINDOWS="${HOME}/.config/hypr/windows.conf"
+MARKER="# codexbar-tui-managed (do not edit this line manually)"
+
+removed=0
+
+strip_marker() {
+  local f="$1"
+  [[ -f "${f}" ]] || return 0
+  grep -qF "${MARKER}" "${f}" || return 0
+  # Rewrite in place via shell redirect — preserves symlinks + file mode.
+  # An `mv` would replace the inode, silently breaking users' dotfile
+  # symlinks and resetting permissions.
+  awk -v m="${MARKER}" '
+    { buf[++n] = $0 }
+    END {
+      for (i = 1; i <= n; i++) {
+        if (buf[i] == m) {
+          drop[i] = drop[i+1] = 1
+          if (i > 1 && buf[i-1] == "") drop[i-1] = 1
+        }
+      }
+      for (i = 1; i <= n; i++) if (!(i in drop)) print buf[i]
+    }
+  ' "${f}" >"${f}.tmp"
+  cat "${f}.tmp" >"${f}"
+  rm -f "${f}.tmp"
+  removed=1
+}
+
+strip_marker "${BINDINGS}"
+strip_marker "${WINDOWS}"
+
+if command -v hyprctl >/dev/null 2>&1 && [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+  hyprctl reload >/dev/null 2>&1 || true
+fi
+
+if (( removed )); then
+  echo "codexbar-tui: Omarchy hotkey removed."
+  echo "  The Super + Ctrl + U binding and the floating windowrule are gone."
+  echo "  Your other Hyprland config is untouched."
+else
+  echo "codexbar-tui: no managed block found — nothing to remove."
+fi
