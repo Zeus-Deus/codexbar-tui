@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# codexbar-tui-setup-omarchy — wire up the Omarchy hotkey + floating window.
+#
+# Adds a Super+Ctrl+U binding that opens codexbar-tui in a centered floating
+# window, the same way Super+Ctrl+B opens the Bluetooth TUI.
+#
+# Idempotent: safe to run multiple times; each run replaces any previous
+# block we've written rather than duplicating it. Rerun after an Omarchy
+# update if anything looks off.
+
+set -euo pipefail
+
+BINDINGS="${HOME}/.config/hypr/bindings.conf"
+WINDOWS="${HOME}/.config/hypr/windows.conf"
+MARKER="# codexbar-tui-managed (do not edit this line manually)"
+
+# --- sanity ------------------------------------------------------------------
+
+if ! command -v codexbar-tui >/dev/null 2>&1; then
+  echo "codexbar-tui is not on \$PATH. Install the package first:" >&2
+  echo "  yay -S codexbar-tui   (or: paru -S codexbar-tui)" >&2
+  exit 1
+fi
+
+if ! command -v omarchy-launch-or-focus-tui >/dev/null 2>&1; then
+  echo "omarchy-launch-or-focus-tui not found — this script is Omarchy-only." >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "${BINDINGS}")"
+touch "${BINDINGS}" "${WINDOWS}"
+
+# --- strip any previous managed block ---------------------------------------
+# A managed block is: (optional preceding blank line) + marker + directive.
+# We drop all three so repeated runs stay diff-clean.
+strip_marker() {
+  local f="$1"
+  grep -qF "${MARKER}" "${f}" || return 0
+  awk -v m="${MARKER}" '
+    { buf[++n] = $0 }
+    END {
+      for (i = 1; i <= n; i++) {
+        if (buf[i] == m) {
+          drop[i] = drop[i+1] = 1
+          if (i > 1 && buf[i-1] == "") drop[i-1] = 1
+        }
+      }
+      for (i = 1; i <= n; i++) if (!(i in drop)) print buf[i]
+    }
+  ' "${f}" >"${f}.tmp" && mv "${f}.tmp" "${f}"
+}
+
+strip_marker "${BINDINGS}"
+strip_marker "${WINDOWS}"
+
+# --- append fresh managed block ---------------------------------------------
+
+cat >>"${BINDINGS}" <<EOF
+
+${MARKER}
+bindd = SUPER CTRL, U, Codex usage, exec, omarchy-launch-or-focus-tui codexbar-tui
+EOF
+
+cat >>"${WINDOWS}" <<EOF
+
+${MARKER}
+windowrule = tag +floating-window, match:class ^(org\\.omarchy\\.codexbar-tui)$
+EOF
+
+# --- reload Hyprland if it's running ----------------------------------------
+
+if command -v hyprctl >/dev/null 2>&1 && [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]]; then
+  hyprctl reload >/dev/null 2>&1 || true
+fi
+
+cat <<EOF
+codexbar-tui: Omarchy hotkey installed.
+
+  Super + Ctrl + U   opens codexbar-tui in a floating window
+  Super + K          lists all keybindings
+
+Rerun this script any time to refresh the binding.
+EOF
