@@ -27,13 +27,26 @@ ok()   { echo "  ok   [${current_test}]: $*"; pass=$((pass + 1)); }
 start() { current_test="$1"; echo; echo "${current_test}  $2"; }
 
 # Build one-off sandbox: tmp HOME, stubbed PATH, setup+remove scripts ready.
+#
+# The sandbox bin is *self-contained* — the real system utilities the
+# setup/remove scripts need (awk, cat, dirname, grep, mkdir, mv, rm,
+# touch, bash, sh, and chmod) are symlinked in so that tests can set
+# PATH="${root}/bin" exclusively without losing basic coreutils. This
+# matters for T07/T08, which verify preflight behaviour when one of the
+# two required binaries (codexbar-tui, omarchy-launch-or-focus-tui) is
+# absent: without isolation, a globally-installed codexbar-tui in
+# /usr/bin would mask the removal and make the preflight pass.
 new_sandbox() {
-  local root
+  local root tool src
   root="$(mktemp -d)"
   mkdir -p "${root}/home/.config/hypr" "${root}/bin"
   : >"${root}/bin/codexbar-tui"
   : >"${root}/bin/omarchy-launch-or-focus-tui"
   chmod +x "${root}/bin/codexbar-tui" "${root}/bin/omarchy-launch-or-focus-tui"
+  for tool in awk cat dirname grep mkdir mv rm touch bash sh chmod; do
+    src="$(command -v "${tool}" 2>/dev/null || true)"
+    [[ -n "${src}" ]] && ln -sf "${src}" "${root}/bin/${tool}"
+  done
   echo "${root}"
 }
 
@@ -207,7 +220,10 @@ start T07 "setup refuses to run without codexbar-tui on PATH"
 {
   root="$(new_sandbox)"
   rm "${root}/bin/codexbar-tui"
-  if HOME="${root}/home" PATH="${root}/bin:/usr/bin:/bin" \
+  # PATH is intentionally *only* the sandbox bin — it already contains
+  # symlinks to awk/grep/mkdir/etc., so the setup script has every tool
+  # it needs AND cannot reach a globally-installed codexbar-tui.
+  if HOME="${root}/home" PATH="${root}/bin" \
      HYPRLAND_INSTANCE_SIGNATURE="" \
      bash "${SETUP}" >/dev/null 2>&1
   then
@@ -227,7 +243,8 @@ start T08 "setup refuses without omarchy-launch-or-focus-tui"
 {
   root="$(new_sandbox)"
   rm "${root}/bin/omarchy-launch-or-focus-tui"
-  if HOME="${root}/home" PATH="${root}/bin:/usr/bin:/bin" \
+  # Sandbox-only PATH; see T07 for why we don't fall back to /usr/bin.
+  if HOME="${root}/home" PATH="${root}/bin" \
      HYPRLAND_INSTANCE_SIGNATURE="" \
      bash "${SETUP}" >/dev/null 2>&1
   then fail "setup exited 0 without omarchy-launch-or-focus-tui"
