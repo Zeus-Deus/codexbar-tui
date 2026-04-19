@@ -31,6 +31,13 @@ use crate::state::{AppState, Command};
 
 const RENDER_TICK: Duration = Duration::from_millis(1000);
 
+/// Faster tick used while at least one panel is showing cached-
+/// not-live data. Matches the cli-spinners `dots` frame interval so
+/// the title-bar spinner steps through every frame without the render
+/// loop starving it. Drops back to `RENDER_TICK` the moment every
+/// panel is live.
+const SPINNER_TICK: Duration = Duration::from_millis(80);
+
 /// Per-provider cache of the latest successful records, kept on the main
 /// thread so we can rebuild a ProviderSnapshot whenever either the usage
 /// records or the cost record changes.
@@ -289,6 +296,13 @@ fn run_event_loop(
     // fall back to the loading placeholder, same as before.
     for p in state.providers.clone() {
         rebuild(&p, state, &caches);
+        if state.snapshot(&p).is_some() {
+            // Flag the panel as provisional so its title dot swaps to
+            // the braille `dots` spinner until the first live usage
+            // poll lands (see `mark_live` in apply_event). That's the
+            // only visual cue that the panel is showing cached data.
+            state.mark_provisional(&p);
+        }
     }
 
     let mut last_tick = Instant::now();
@@ -312,12 +326,22 @@ fn run_event_loop(
         }
 
         let now = Utc::now();
-        terminal.draw(|f| ui::draw(f, state, now))?;
+        let frame_clock = Instant::now();
+        terminal.draw(|f| ui::draw(f, state, now, frame_clock))?;
 
-        // Sleep until the next 1 Hz tick, but handle key events as they
-        // arrive (crossterm::event::poll uses millisecond granularity).
+        // Render cadence is adaptive: 80 ms while at least one panel
+        // is still showing cached data (so the title spinner steps
+        // through its frames smoothly), back to the idle 1 Hz tick as
+        // soon as every panel is live. Key input is serviced at
+        // whichever tick is active because `event::poll` returns
+        // immediately on any keystroke regardless of timeout.
+        let tick = if state.has_provisional() {
+            SPINNER_TICK
+        } else {
+            RENDER_TICK
+        };
         let elapsed = last_tick.elapsed();
-        let remaining = RENDER_TICK.saturating_sub(elapsed);
+        let remaining = tick.saturating_sub(elapsed);
         if event::poll(remaining)? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
@@ -344,7 +368,12 @@ fn run_event_loop(
                 }
             }
         }
-        if last_tick.elapsed() >= RENDER_TICK {
+        // Reset the tick accumulator whenever we've slept for at least
+        // one full period of whichever cadence is current. Using `tick`
+        // (not a fixed RENDER_TICK) so spinner frames don't starve: at
+        // spinner cadence we reset every 80 ms and render every 80 ms;
+        // at idle cadence every 1 s and every 1 s.
+        if last_tick.elapsed() >= tick {
             last_tick = Instant::now();
         }
     }
@@ -363,6 +392,13 @@ fn apply_event(
                 records,
             });
             rebuild(&provider, state, caches);
+            // Live usage replaces the cached values on the bars — flip
+            // this provider from "cached" to "live" so the title-bar
+            // spinner stops and the static health dot returns. Cost
+            // events deliberately don't clear this flag: cost data
+            // doesn't change the bars, so the panel is still visually
+            // "cached" until usage itself lands.
+            state.mark_live(&provider);
             maybe_pause_after(&provider, Command::Usage, state, handles);
             state.clear_status();
             // Persist AFTER rebuild so the new data is definitely in

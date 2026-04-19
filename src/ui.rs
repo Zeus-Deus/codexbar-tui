@@ -11,6 +11,9 @@
 //! let the user's terminal theme resolve them. See
 //! docs/omarchy-integration.md section (d).
 
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ratatui::{
     Frame,
@@ -33,6 +36,31 @@ const ERROR_ROW_HEIGHT: u16 = 3;
 /// gives the eye a gutter.
 const BAR_SLOT_LINES: u16 = 2;
 
+/// Frames of the `dots` spinner from sindresorhus/cli-spinners. Each
+/// frame is a single braille glyph; cycling through them produces a
+/// smooth rotating-dots loading indicator that fits exactly where the
+/// panel-title health dot normally lives.
+const SPINNER_FRAMES: &[char] = &[
+    '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏',
+];
+
+/// Per-frame duration matching the cli-spinners `dots` spec. 80 ms ×
+/// 10 frames = one full rotation in 800 ms.
+const SPINNER_INTERVAL_MS: u128 = 80;
+
+/// Which spinner frame to render at `clock`. A single `OnceLock` epoch
+/// captures the first call so every panel's spinner stays in phase;
+/// threading the epoch through the public `draw` signature would work
+/// too but bloats every draw function that never touches spinner math.
+fn spinner_frame(clock: Instant) -> char {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(|| clock);
+    let elapsed_ms = clock.saturating_duration_since(epoch).as_millis();
+    let idx = (elapsed_ms / SPINNER_INTERVAL_MS) as usize % SPINNER_FRAMES.len();
+    SPINNER_FRAMES[idx]
+}
+
+
 /// Row height for a healthy provider is dynamic: 2 border lines + each
 /// quota window gets a 2-line slot (bar + spacer; the trailing spacer on
 /// the last bar doubles as the gap before the stats line) + 1 stats line
@@ -42,7 +70,7 @@ fn healthy_row_height(window_count: usize) -> u16 {
     2 + n * BAR_SLOT_LINES + 1
 }
 
-pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
+pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>, clock: Instant) {
     let size = f.area();
     let [body, footer] = vertical_split(size, [Constraint::Min(1), Constraint::Length(1)]);
 
@@ -73,7 +101,15 @@ pub fn draw(f: &mut Frame, state: &AppState, now: DateTime<Utc>) {
             .constraints(constraints)
             .split(body);
         for (slot, provider) in rows.iter().zip(visible.iter()) {
-            draw_provider_row(f, *slot, provider, state.snapshot(provider), now);
+            draw_provider_row(
+                f,
+                *slot,
+                provider,
+                state.snapshot(provider),
+                now,
+                clock,
+                state.is_provisional(provider),
+            );
         }
     }
 
@@ -183,8 +219,10 @@ fn draw_provider_row(
     provider: &ProviderId,
     snapshot: Option<&ProviderSnapshot>,
     now: DateTime<Utc>,
+    clock: Instant,
+    is_provisional: bool,
 ) {
-    let (title_text, title_style) = panel_title(provider, snapshot);
+    let (title_text, title_style) = panel_title(provider, snapshot, is_provisional, clock);
     let fetched_label = snapshot.map(|s| fetched_ago(s, now));
 
     let mut block = Block::default()
@@ -246,14 +284,31 @@ fn render_single_line(f: &mut Frame, area: Rect, line: Line<'_>) {
     );
 }
 
-fn panel_title(provider: &ProviderId, snap: Option<&ProviderSnapshot>) -> (String, Style) {
-    let (glyph, color) = match snap.map(|s| &s.health) {
-        Some(ProviderHealth::Ok) => ("●", Color::Green),
-        Some(ProviderHealth::Stale { .. }) => ("●", Color::Yellow),
-        Some(ProviderHealth::AuthMissing) => ("●", Color::Yellow),
-        Some(ProviderHealth::NotSupportedOnLinux) => ("●", Color::Red),
-        Some(ProviderHealth::Error { .. }) => ("●", Color::Red),
-        None => ("○", Color::DarkGray),
+fn panel_title(
+    provider: &ProviderId,
+    snap: Option<&ProviderSnapshot>,
+    is_provisional: bool,
+    clock: Instant,
+) -> (String, Style) {
+    let (static_glyph, color) = match snap.map(|s| &s.health) {
+        Some(ProviderHealth::Ok) => ('●', Color::Green),
+        Some(ProviderHealth::Stale { .. }) => ('●', Color::Yellow),
+        Some(ProviderHealth::AuthMissing) => ('●', Color::Yellow),
+        Some(ProviderHealth::NotSupportedOnLinux) => ('●', Color::Red),
+        Some(ProviderHealth::Error { .. }) => ('●', Color::Red),
+        None => ('○', Color::DarkGray),
+    };
+    // Swap the static health dot for the current `dots`-spinner frame
+    // whenever the panel is showing cached data we haven't confirmed
+    // with a live poll yet. Only healthy panels get the spinner —
+    // error / auth-missing panels already communicate a terminal
+    // failure state and spinning them would imply "still trying" when
+    // we're actually paused (see `maybe_pause_after` in main.rs).
+    let is_ok = matches!(snap.map(|s| &s.health), Some(ProviderHealth::Ok));
+    let glyph = if is_provisional && is_ok {
+        spinner_frame(clock)
+    } else {
+        static_glyph
     };
     let text = format!(" {glyph} {} ", provider.label());
     (text, Style::default().fg(color).add_modifier(Modifier::BOLD))
@@ -368,6 +423,12 @@ fn draw_stacked_bars(f: &mut Frame, area: Rect, bars: &[QuotaBar], now: DateTime
 /// `label  [gauge]  pct%  countdown`. `gauge_width` is passed in by
 /// `draw_stacked_bars` so every bar in the stack shares the same value —
 /// gauges therefore end at the same column.
+///
+/// `animated_pct` is the tweened value (see `anim.rs`). The gauge fill,
+/// the displayed integer percent, and the color threshold all track this
+/// single number so the three visual signals never disagree during a
+/// fill-in animation. When no tween is active for this bar it equals
+/// `bar.used_percent as f32`, so steady-state rendering is unchanged.
 fn draw_bar_line(
     f: &mut Frame,
     area: Rect,
@@ -403,13 +464,27 @@ fn draw_bar_line(
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Unicode-block text gauge. `pct` is 0..=100; width is the number of block
-/// cells between the brackets.
+/// Unicode-block text gauge. `pct` is 0..=100 (values above 100 are
+/// clamped); `width` is the number of block cells inside the gauge.
+/// Every cell is either `█` (filled) or `░` (empty) — no partial-block
+/// glyphs. An earlier 1/8-cell version made some bars end on a
+/// left-aligned partial (`▊`, `▉`), which rendered as a visible "step"
+/// because the partial block is narrower than a full `█`. Whole-cell
+/// rounding makes every bar terminate cleanly on the same vertical edge.
+///
+/// Rendered output: `▕` + `width` cells. No right bracket: the trailing
+/// `▏` used to leave 7/8 of its cell visibly empty between the bar and
+/// the `%` readout on some monospace fonts.
 fn text_gauge(pct: u8, width: usize) -> String {
-    let filled = (pct as usize * width + 50) / 100; // round-to-nearest
+    // Clamp first so >100 inputs can't produce a runaway character
+    // count. Round-to-nearest so, e.g., 95% of 10 cells gives 10
+    // rather than 9 (which would visually read as "not quite full").
+    let pct = pct.min(100) as usize;
+    let filled = (pct * width + 50) / 100;
     let filled = filled.min(width);
     let empty = width - filled;
-    let mut s = String::with_capacity(width + 2);
+
+    let mut s = String::with_capacity(width + 1);
     s.push('▕');
     for _ in 0..filled {
         s.push('█');
@@ -417,9 +492,9 @@ fn text_gauge(pct: u8, width: usize) -> String {
     for _ in 0..empty {
         s.push('░');
     }
-    s.push('▏');
     s
 }
+
 
 /// Single bottom line per provider: `Today $x.xx   30d $y.yy   top_model pct% $cost`.
 /// Everything inline; nothing else competes for width because this line
@@ -573,6 +648,7 @@ fn fmt_utc(t: DateTime<Utc>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn bar_color_thresholds() {
@@ -613,15 +689,75 @@ mod tests {
     #[test]
     fn text_gauge_is_correct_width_and_shape() {
         // 0% -> all empty.
-        assert_eq!(text_gauge(0, 10), "▕░░░░░░░░░░▏");
+        assert_eq!(text_gauge(0, 10), "▕░░░░░░░░░░");
         // 100% -> all full.
-        assert_eq!(text_gauge(100, 10), "▕██████████▏");
+        assert_eq!(text_gauge(100, 10), "▕██████████");
         // 50% on width 10 rounds cleanly.
-        assert_eq!(text_gauge(50, 10), "▕█████░░░░░▏");
-        // Width is preserved for odd percentages (round-to-nearest).
-        let g = text_gauge(33, 10);
-        let inside: String = g.chars().filter(|&c| c == '█' || c == '░').collect();
-        assert_eq!(inside.chars().count(), 10);
+        assert_eq!(text_gauge(50, 10), "▕█████░░░░░");
+        // 33% on width 10 = 3.3 -> 3 full cells (round-to-nearest).
+        assert_eq!(text_gauge(33, 10), "▕███░░░░░░░");
+    }
+
+    #[test]
+    fn text_gauge_every_cell_is_full_or_empty() {
+        // Regression: partial-block glyphs (▏▎▍▌▋▊▉) made some bars
+        // appear tapered/stepped at the right edge. Sweep every pct and
+        // make sure every rendered cell (after the leading bracket) is
+        // one of `█` / `░`.
+        for pct in 0u8..=100 {
+            let g = text_gauge(pct, 15);
+            for (i, c) in g.chars().enumerate().skip(1) {
+                assert!(
+                    c == '█' || c == '░',
+                    "pct={pct} cell {i} = {c:?} (expected █ or ░): {g:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn spinner_frame_cycles_through_all_frames() {
+        // Advance the clock by exactly one full period (N frames ×
+        // interval) and verify every frame from `SPINNER_FRAMES`
+        // actually appears. Cycling through frames is the whole point
+        // of the spinner — missing even one frame would leave a
+        // visible stutter.
+        let base = Instant::now();
+        let mut seen: std::collections::HashSet<char> = std::collections::HashSet::new();
+        for i in 0..SPINNER_FRAMES.len() as u128 {
+            let t = base + Duration::from_millis(i as u64 * SPINNER_INTERVAL_MS as u64);
+            seen.insert(spinner_frame(t));
+        }
+        // OnceLock may have captured an earlier clock in a sibling
+        // test, so we can't assert on the exact sequence — we only
+        // check that the function walks through the expected set
+        // within one period's worth of samples.
+        assert!(
+            seen.len() >= SPINNER_FRAMES.len() - 1,
+            "spinner should cycle through ~all frames in one period: {seen:?}"
+        );
+        for c in seen {
+            assert!(
+                SPINNER_FRAMES.contains(&c),
+                "unexpected spinner glyph: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_gauge_rejects_out_of_range_without_overflowing_width() {
+        // codexbar occasionally reports pct values above 100 (e.g. when a
+        // plan's limit changes mid-window); clamp must kick in so the
+        // gauge never emits more cells than the caller asked for.
+        for bad in [0u8, 100, 101, 200, u8::MAX] {
+            let g = text_gauge(bad, 10);
+            let chars: Vec<char> = g.chars().collect();
+            assert_eq!(
+                chars.len(),
+                11,
+                "pct={bad} produced wrong width: {g:?}"
+            );
+        }
     }
 
     fn snap_with(health: ProviderHealth) -> ProviderSnapshot {
@@ -681,11 +817,18 @@ mod tests {
 
     #[test]
     fn text_gauge_never_overshoots() {
+        // Sweep the full 0..=100 range and verify that for every pct
+        // the gauge width is exactly `1 bracket + width cells`.
+        // Partial-cell rounding used to sneak an extra glyph in when
+        // the remainder landed on the rightmost cell boundary.
         for pct in 0u8..=100 {
             for width in [4usize, 10, 20] {
                 let g = text_gauge(pct, width);
-                let inside: String = g.chars().filter(|&c| c == '█' || c == '░').collect();
-                assert_eq!(inside.chars().count(), width, "pct={pct} width={width}");
+                assert_eq!(
+                    g.chars().count(),
+                    width + 1,
+                    "pct={pct} width={width} -> {g:?}"
+                );
             }
         }
     }

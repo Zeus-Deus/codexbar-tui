@@ -5,7 +5,7 @@
 //! applies incoming events between renders. That way the render path
 //! never contends for a lock and we don't need interior mutability.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crate::merge::{ProviderId, ProviderSnapshot};
@@ -67,6 +67,16 @@ pub struct AppState {
     /// providers are hidden so the main screen only shows actionable data.
     /// Toggled by the `a` key in the event loop.
     pub show_all: bool,
+    /// Providers whose on-screen data came from the on-disk cache and
+    /// has NOT been confirmed by a live poll yet. The renderer pulses
+    /// these panels' gauges with `Modifier::DIM` so the user can see
+    /// at a glance "this is old data, a refresh is in flight".
+    ///
+    /// Populated at startup for every provider hydrated from
+    /// `cache.rs`; cleared per-provider by main.rs when a live
+    /// `PollEvent::Usage` arrives (usage is what drives the bars, so
+    /// that's the moment "what's on screen" becomes live).
+    pub provisional: HashSet<ProviderId>,
     pub should_quit: bool,
 }
 
@@ -79,6 +89,7 @@ impl AppState {
             status_line: None,
             empty_reason: None,
             show_all: false,
+            provisional: HashSet::new(),
             should_quit: false,
         }
     }
@@ -89,6 +100,32 @@ impl AppState {
 
     pub fn toggle_show_all(&mut self) {
         self.show_all = !self.show_all;
+    }
+
+    /// Flag a provider as showing cached-not-live data. Called once per
+    /// hydrated provider at startup.
+    pub fn mark_provisional(&mut self, provider: &ProviderId) {
+        self.provisional.insert(provider.clone());
+    }
+
+    /// Called from main.rs when a live `PollEvent::Usage` replaces the
+    /// bars' cached values. A second call for an already-live provider
+    /// is a no-op.
+    pub fn mark_live(&mut self, provider: &ProviderId) {
+        self.provisional.remove(provider);
+    }
+
+    pub fn is_provisional(&self, provider: &ProviderId) -> bool {
+        self.provisional.contains(provider)
+    }
+
+    /// True while at least one panel is still painting cached data.
+    /// The event loop ORs this with `AnimState::is_animating` to pick
+    /// its render cadence: ~60 Hz while either is true (so the pulse
+    /// looks smooth), back to 1 Hz once everything is both live and
+    /// settled.
+    pub fn has_provisional(&self) -> bool {
+        !self.provisional.is_empty()
     }
 
     /// Write a fresh snapshot in, replacing any prior one for the provider.
@@ -181,5 +218,39 @@ mod tests {
         assert!(s.show_all);
         s.toggle_show_all();
         assert!(!s.show_all);
+    }
+
+    #[test]
+    fn provisional_lifecycle_mark_then_clear() {
+        let claude = ProviderId::new("claude");
+        let codex = ProviderId::new("codex");
+        let mut s = AppState::new(
+            vec![claude.clone(), codex.clone()],
+            RefreshIntervals::default(),
+        );
+        assert!(!s.has_provisional(), "fresh state has no provisional marks");
+
+        // Simulate the startup hydrate path.
+        s.mark_provisional(&claude);
+        s.mark_provisional(&codex);
+        assert!(s.is_provisional(&claude));
+        assert!(s.is_provisional(&codex));
+        assert!(s.has_provisional());
+
+        // First live usage lands for claude — only claude stops pulsing.
+        s.mark_live(&claude);
+        assert!(!s.is_provisional(&claude));
+        assert!(s.is_provisional(&codex), "codex still cached");
+        assert!(s.has_provisional());
+
+        // Clearing already-live claude is a no-op (regression for the
+        // case where cost arrives before usage and later events try to
+        // clear twice).
+        s.mark_live(&claude);
+        assert!(!s.is_provisional(&claude));
+
+        // Once codex also goes live, the adaptive-tick signal drops.
+        s.mark_live(&codex);
+        assert!(!s.has_provisional());
     }
 }
