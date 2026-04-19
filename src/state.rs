@@ -51,6 +51,11 @@ pub enum Command {
 #[derive(Debug)]
 pub struct AppState {
     pub providers: Vec<ProviderId>,
+    // Held on the state so a future `r`-with-cadence override or a
+    // config-reload path can read current tick intervals without
+    // re-threading them through the scheduler. Main only references the
+    // RENDER_TICK / SPINNER_TICK constants today.
+    #[allow(dead_code)]
     pub intervals: RefreshIntervals,
     pub snapshots: HashMap<ProviderId, ProviderSnapshot>,
     /// Sticky status line at the bottom: "Refreshing Claude usage…",

@@ -31,9 +31,16 @@ pub enum SpawnError {
 
 #[derive(Debug)]
 pub struct Output {
+    // status/stderr/elapsed are captured for diagnostics and for a future
+    // logging pass — callers currently only consume `stdout`. Keep them in
+    // the returned struct so worker panic messages can include them without
+    // re-plumbing the spawn signature.
+    #[allow(dead_code)]
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
+    #[allow(dead_code)]
     pub stderr: Vec<u8>,
+    #[allow(dead_code)]
     pub elapsed: Duration,
 }
 

@@ -97,6 +97,10 @@ fn pretty_name(id: &str) -> String {
 #[derive(Debug, Clone)]
 pub enum ProviderHealth {
     Ok,
+    // Reserved for a future "last snapshot older than N ticks" state the
+    // scheduler can emit without re-running codexbar. Kept in the domain
+    // model so the renderer already knows to handle it when wired up.
+    #[allow(dead_code)]
     Stale { since: DateTime<Utc> },
     AuthMissing,
     NotSupportedOnLinux,
@@ -108,6 +112,10 @@ pub struct QuotaBar {
     pub used_percent: u8,
     pub window_label: String,
     pub resets_at: Option<DateTime<Utc>>,
+    // Human string like "2h 14m" that upstream sometimes provides alongside
+    // `resets_at`. Parsed and stored verbatim for a future renderer pass
+    // that prefers the upstream phrasing over our own relative formatter.
+    #[allow(dead_code)]
     pub reset_hint: Option<String>,
 }
 
@@ -115,6 +123,10 @@ pub struct QuotaBar {
 pub struct ModelShare {
     pub model: String,
     pub cost: f64,
+    // Raw token count from codexbar's daily cost record. The panel currently
+    // ranks by cost share, but keep the field so a future "tokens-per-model"
+    // view doesn't require re-parsing.
+    #[allow(dead_code)]
     pub tokens: u64,
     pub percent_of_day: u8,
 }
@@ -282,25 +294,25 @@ pub fn build_snapshot(
     }
 
     // --- Cost ----------------------------------------------------------
-    if let Some(cost) = cost_record {
-        if !cost.daily.is_empty() {
-            let today_bucket = cost.daily.iter().find(|d| d.date == today);
-            // Preserve `None` when today's bucket omitted `totalCost`
-            // (codexbar does this for days whose models it can't price —
-            // e.g. freshly-released models). The renderer shows "—" in
-            // that case, distinguishable from a real $0.00 day.
-            snap.cost_today = today_bucket.and_then(|d| d.total_cost);
-            snap.top_models_today = top_models(today_bucket);
+    if let Some(cost) = cost_record
+        && !cost.daily.is_empty()
+    {
+        let today_bucket = cost.daily.iter().find(|d| d.date == today);
+        // Preserve `None` when today's bucket omitted `totalCost`
+        // (codexbar does this for days whose models it can't price —
+        // e.g. freshly-released models). The renderer shows "—" in
+        // that case, distinguishable from a real $0.00 day.
+        snap.cost_today = today_bucket.and_then(|d| d.total_cost);
+        snap.top_models_today = top_models(today_bucket);
 
-            // 30-day rolling sum: sort descending and take the head.
-            // Missing `totalCost` counts as zero for the tally (we'd
-            // rather under-report than skip the day entirely).
-            let mut by_date: Vec<&DailyCost> = cost.daily.iter().collect();
-            by_date.sort_by(|a, b| b.date.cmp(&a.date));
-            let slice = &by_date[..by_date.len().min(30)];
-            let sum: f64 = slice.iter().map(|d| d.total_cost.unwrap_or(0.0)).sum();
-            snap.cost_30d = Some(sum);
-        }
+        // 30-day rolling sum: sort descending and take the head.
+        // Missing `totalCost` counts as zero for the tally (we'd
+        // rather under-report than skip the day entirely).
+        let mut by_date: Vec<&DailyCost> = cost.daily.iter().collect();
+        by_date.sort_by(|a, b| b.date.cmp(&a.date));
+        let slice = &by_date[..by_date.len().min(30)];
+        let sum: f64 = slice.iter().map(|d| d.total_cost.unwrap_or(0.0)).sum();
+        snap.cost_30d = Some(sum);
     }
 
     snap

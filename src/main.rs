@@ -342,30 +342,27 @@ fn run_event_loop(
         };
         let elapsed = last_tick.elapsed();
         let remaining = tick.saturating_sub(elapsed);
-        if event::poll(remaining)? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => state.quit(),
-                        KeyCode::Char('c')
-                            if k.modifiers.contains(event::KeyModifiers::CONTROL) =>
-                        {
-                            state.quit();
-                        }
-                        KeyCode::Char('r') => {
-                            broadcast_refresh(handles);
-                            state.set_status("refreshing…");
-                        }
-                        KeyCode::Char('a') => {
-                            state.toggle_show_all();
-                            // Drop any sticky startup status so the footer's
-                            // left side stops obscuring the mode indicator
-                            // the moment the user engages with the toggle.
-                            state.clear_status();
-                        }
-                        _ => {}
-                    }
+        if event::poll(remaining)?
+            && let Event::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+        {
+            match k.code {
+                KeyCode::Char('q') | KeyCode::Esc => state.quit(),
+                KeyCode::Char('c') if k.modifiers.contains(event::KeyModifiers::CONTROL) => {
+                    state.quit();
                 }
+                KeyCode::Char('r') => {
+                    broadcast_refresh(handles);
+                    state.set_status("refreshing…");
+                }
+                KeyCode::Char('a') => {
+                    state.toggle_show_all();
+                    // Drop any sticky startup status so the footer's
+                    // left side stops obscuring the mode indicator
+                    // the moment the user engages with the toggle.
+                    state.clear_status();
+                }
+                _ => {}
             }
         }
         // Reset the tick accumulator whenever we've slept for at least
