@@ -1,6 +1,6 @@
 [package]
 name = "codexbar-tui"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Thin terminal UI on top of the codexbar CLI (steipete/CodexBar), Omarchy-themed."
 license = "MIT"
