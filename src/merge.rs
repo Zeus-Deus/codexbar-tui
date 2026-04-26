@@ -269,15 +269,35 @@ pub fn build_snapshot(
                     if let Some(w) = slot {
                         let mut bar = to_bar(w);
                         if snap.windows.iter().any(|b| b.window_label == bar.window_label) {
+                            // The renderer truncates labels at 7 chars
+                            // (LABEL_COL - 1), so a "weekly opus"
+                            // disambiguator would render as "weekly "
+                            // and look identical to the real "weekly"
+                            // bar above it. Pick a short distinct
+                            // anchor instead.
                             bar.window_label = match (target_id.as_str(), slot_name) {
-                                ("claude", "tertiary") => {
-                                    format!("{} opus", bar.window_label)
-                                }
+                                ("claude", "tertiary") => "opus".into(),
                                 _ => format!("{} ({slot_name})", bar.window_label),
                             };
                         }
                         snap.windows.push(bar);
                     }
+                }
+                // codexbar v0.23 emits named extras (Claude Designs / Daily
+                // Routines). Append them after the slotted windows so the
+                // panel renders them in upstream order. Use a short label
+                // keyed off the stable `id` for the well-known extras —
+                // upstream titles like "Daily Routines" don't fit
+                // LABEL_COL — and fall back to the lowercased title for
+                // anything new.
+                for extra in &u.extra_rate_windows {
+                    let mut bar = to_bar(&extra.window);
+                    bar.window_label = match extra.id.as_str() {
+                        "claude-design" => "designs".into(),
+                        "claude-routines" => "routines".into(),
+                        _ => extra.title.to_lowercase(),
+                    };
+                    snap.windows.push(bar);
                 }
             }
             (None, Some(e)) => {
@@ -353,6 +373,8 @@ mod tests {
     use crate::parse::{parse_cost, parse_usage};
 
     const USAGE_CLAUDE_CLI: &[u8] = include_bytes!("../docs/cli-reference/usage-claude-cli.json");
+    const USAGE_CLAUDE_OAUTH: &[u8] =
+        include_bytes!("../docs/cli-reference/usage-claude-oauth.json");
     const USAGE_CODEX_CLI: &[u8] = include_bytes!("../docs/cli-reference/usage-codex-cli.json");
     const USAGE_CLAUDE_AUTO: &[u8] = include_bytes!("../docs/cli-reference/usage-claude.json");
     const COST_CLAUDE: &[u8] = include_bytes!("../docs/cli-reference/cost-claude.json");
@@ -386,9 +408,10 @@ mod tests {
             "secondary weekly carries resetsAt"
         );
         // Tertiary is Claude's Opus-specific weekly sub-limit. The
-        // merger disambiguates the label since both weeklies would
-        // otherwise read the same.
-        assert_eq!(snap.windows[2].window_label, "weekly opus");
+        // merger disambiguates with a short anchor ("opus") because
+        // the renderer's 7-char label column would truncate a longer
+        // "weekly opus" to look identical to the real weekly bar.
+        assert_eq!(snap.windows[2].window_label, "opus");
         assert!(snap.cost_today.is_some());
         assert!(snap.cost_30d.is_some());
         assert!(!snap.top_models_today.is_empty());
@@ -402,6 +425,30 @@ mod tests {
         assert!(matches!(snap.health, ProviderHealth::AuthMissing));
         assert!(snap.windows.is_empty());
         assert!(snap.last_error.is_some());
+    }
+
+    #[test]
+    fn claude_oauth_v023_appends_extra_rate_windows_after_slot_bars() {
+        // codexbar v0.23 OAuth on Linux: primary + secondary + tertiary,
+        // PLUS extraRateWindows for Designs / Daily Routines. Snapshot
+        // must surface all five bars in upstream order, with the extras
+        // labelled from the upstream `title` (lowercased).
+        let usage = parse_usage(USAGE_CLAUDE_OAUTH).unwrap();
+        let snap = build_snapshot(claude(), &usage, None, today(), now_utc());
+        assert!(matches!(snap.health, ProviderHealth::Ok));
+        assert_eq!(
+            snap.windows.len(),
+            5,
+            "expect primary + secondary + tertiary + designs + routines"
+        );
+        // Slot bars come first, in primary→secondary→tertiary order.
+        assert_eq!(snap.windows[0].window_label, "5h");
+        assert_eq!(snap.windows[1].window_label, "weekly");
+        assert_eq!(snap.windows[2].window_label, "opus");
+        // Then the extras, in upstream emit order, with short labels
+        // mapped from the stable `id` (so they fit LABEL_COL).
+        assert_eq!(snap.windows[3].window_label, "designs");
+        assert_eq!(snap.windows[4].window_label, "routines");
     }
 
     #[test]

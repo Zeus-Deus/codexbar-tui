@@ -99,6 +99,14 @@
     {
       "enabled" : false,
       "id" : "perplexity"
+    },
+    {
+      "enabled" : false,
+      "id" : "abacus"
+    },
+    {
+      "enabled" : false,
+      "id" : "mistral"
     }
   ],
   "version" : 1

@@ -2,7 +2,7 @@
 //! on Linux.
 //!
 //! Every ID in [`LINUX_WEB_ONLY`] is a provider whose only source mode in
-//! codexbar v0.20 is `web` — which on Linux errors with
+//! codexbar (through v0.23) is `web` — which on Linux errors with
 //! `"selected source requires web support and is only supported on macOS."`
 //! (see `docs/cli-reference/linux-caveats.md`). There is no point spawning
 //! a worker for these: every poll would fail immediately and the user would
@@ -17,8 +17,8 @@
 //! `copilot`, `kimik2`, `kilo`, `kiro`, `vertexai`, `jetbrains`,
 //! `antigravity`, `synthetic` (env-var / API-key / local-file auth).
 
-/// Providers whose only v0.20 source mode (`web`) is macOS-gated. Skipped
-/// at startup so we never spawn a worker that can only return errors.
+/// Providers whose only source mode (`web`) is macOS-gated. Skipped at
+/// startup so we never spawn a worker that can only return errors.
 pub const LINUX_WEB_ONLY: &[&str] = &[
     "cursor",
     "opencode",
@@ -29,6 +29,9 @@ pub const LINUX_WEB_ONLY: &[&str] = &[
     "factory",
     "ollama",
     "minimax",
+    // v0.23 additions (PR steipete/CodexBar#607). Both ship only a web
+    // fetch strategy with macOS-gated cookie cache branches.
+    "mistral",
 ];
 
 /// Case-insensitive membership check against [`LINUX_WEB_ONLY`].
@@ -39,13 +42,20 @@ pub fn is_linux_web_only(id: &str) -> bool {
 
 /// Which `--source` mode to pass to codexbar for this provider.
 ///
-/// codexbar v0.20 only accepts `cli` for a small set of providers
-/// (Claude, Codex, Kiro); most others demand `api` (env-var or device
-/// flow tokens), a couple demand `oauth` (Vertex AI) or `local`
-/// (Antigravity, JetBrains). Passing the wrong mode is hard-rejected with
-/// `"Source 'cli' is not supported for <id>"` — exactly the error the
-/// user was seeing on Copilot / Gemini / z.ai / etc. panels before this
-/// lookup existed.
+/// codexbar accepts `cli` for a small set of providers (Codex, Kiro);
+/// most others demand `api` (env-var or device flow tokens), a couple
+/// demand `oauth` (Vertex AI, Claude on Linux) or `local` (Antigravity,
+/// JetBrains). Passing the wrong mode is hard-rejected with `"Source
+/// 'cli' is not supported for <id>"` — exactly the error the user was
+/// seeing on Copilot / Gemini / z.ai / etc. panels before this lookup
+/// existed.
+///
+/// **Claude uses `oauth` on Linux**, not `cli`: as of codexbar v0.23 the
+/// OAuth fetcher returns the full primary/secondary/tertiary trio plus
+/// `extraRateWindows` (Designs / Daily Routines), where the CLI source
+/// returns only primary + secondary. The OAuth path also exists in v0.20
+/// and was the agent-audited Linux-canonical path; switching costs
+/// nothing on older binaries and unlocks the new bars on v0.23+.
 ///
 /// Unknown providers fall back to `cli` (conservative — codexbar will
 /// reply with a clear "Source 'cli' is not supported" message that the
@@ -54,7 +64,11 @@ pub fn is_linux_web_only(id: &str) -> bool {
 pub fn preferred_source(id: &str) -> &'static str {
     match id.trim().to_ascii_lowercase().as_str() {
         // CLI-source providers (local tool spawned by codexbar).
-        "claude" | "codex" | "kiro" => "cli",
+        "codex" | "kiro" => "cli",
+
+        // Claude: OAuth on Linux. Returns the complete window set
+        // (primary + secondary + tertiary) and v0.23's extraRateWindows.
+        "claude" => "oauth",
 
         // OAuth / ADC-file providers.
         "vertexai" => "oauth",
@@ -160,6 +174,16 @@ mod tests {
     }
 
     #[test]
+    fn skip_list_covers_v023_additions() {
+        // codexbar v0.21 added abacus, v0.23 added mistral. Both ship only
+        // a Web fetch strategy on Linux. Without these entries, `config
+        // dump` would surface them as panels and every poll would error
+        // with the macOS-only message.
+        assert!(is_linux_web_only("abacus"));
+        assert!(is_linux_web_only("mistral"));
+    }
+
+    #[test]
     fn skip_list_has_no_duplicates() {
         let mut seen = std::collections::HashSet::new();
         for id in LINUX_WEB_ONLY {
@@ -172,7 +196,8 @@ mod tests {
         // The audit documented in docs/cli-reference/runtime-deps.md is the
         // source of truth for these. Any change to this map without a
         // matching change to the doc is a mistake.
-        assert_eq!(preferred_source("claude"), "cli");
+        // Claude moved to oauth in 0.1.3 — see preferred_source() docs.
+        assert_eq!(preferred_source("claude"), "oauth");
         assert_eq!(preferred_source("codex"), "cli");
         assert_eq!(preferred_source("kiro"), "cli");
         assert_eq!(preferred_source("vertexai"), "oauth");
@@ -186,7 +211,7 @@ mod tests {
         assert_eq!(preferred_source("kimik2"), "api");
         assert_eq!(preferred_source("synthetic"), "api");
         // Case insensitive + leading/trailing whitespace tolerated.
-        assert_eq!(preferred_source("  CLAUDE "), "cli");
+        assert_eq!(preferred_source("  CLAUDE "), "oauth");
         assert_eq!(preferred_source("Gemini"), "api");
         // Unknown provider IDs fall back to `cli`.
         assert_eq!(preferred_source("some-brand-new-provider"), "cli");

@@ -61,8 +61,25 @@ pub struct UsageBlock {
     pub secondary: Option<Window>,
     #[serde(default)]
     pub tertiary: Option<Window>,
+    /// Named rate windows beyond the primary/secondary/tertiary slots.
+    /// Added in codexbar v0.23 for Claude's "Designs" and "Daily Routines"
+    /// usage bars (PR steipete/CodexBar#740). Empty/absent on older
+    /// builds and on providers that don't expose extras.
+    #[serde(default, rename = "extraRateWindows")]
+    pub extra_rate_windows: Vec<NamedRateWindow>,
     #[serde(rename = "updatedAt")]
     pub updated_at: DateTime<Utc>,
+}
+
+/// A rate-limit window the provider names explicitly rather than slotting
+/// into primary/secondary/tertiary. The `id` is a stable upstream key
+/// (e.g. `claude-design`, `claude-routines`); `title` is the display
+/// string upstream wants us to render.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NamedRateWindow {
+    pub id: String,
+    pub title: String,
+    pub window: Window,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -320,6 +337,8 @@ mod tests {
     use super::*;
 
     const USAGE_CLAUDE_CLI: &[u8] = include_bytes!("../docs/cli-reference/usage-claude-cli.json");
+    const USAGE_CLAUDE_OAUTH: &[u8] =
+        include_bytes!("../docs/cli-reference/usage-claude-oauth.json");
     const USAGE_CLAUDE_STATUS: &[u8] =
         include_bytes!("../docs/cli-reference/usage-claude-status.json");
     const USAGE_CLAUDE_AUTO: &[u8] = include_bytes!("../docs/cli-reference/usage-claude.json");
@@ -348,6 +367,46 @@ mod tests {
         let secondary = u.secondary.as_ref().unwrap();
         assert!(secondary.resets_at.is_some());
         assert!(secondary.reset_description.is_some());
+    }
+
+    #[test]
+    fn usage_claude_oauth_v023_carries_extra_rate_windows() {
+        // v0.23 OAuth response (Linux) — primary/secondary/tertiary plus
+        // the new Claude Designs / Daily Routines bars.
+        let rs = parse_usage(USAGE_CLAUDE_OAUTH).unwrap();
+        assert_eq!(rs.len(), 1);
+        let r = &rs[0];
+        assert_eq!(r.provider, "claude");
+        assert_eq!(r.source, "oauth");
+        let u = r.usage.as_ref().expect("usage block");
+        // Existing slots still parse.
+        assert_eq!(u.primary.as_ref().unwrap().window_minutes, 300);
+        assert_eq!(u.secondary.as_ref().unwrap().window_minutes, 10080);
+        // The new top-level field is populated with both Claude bars.
+        assert_eq!(u.extra_rate_windows.len(), 2);
+        let designs = u
+            .extra_rate_windows
+            .iter()
+            .find(|w| w.id == "claude-design")
+            .expect("designs window");
+        assert_eq!(designs.title, "Designs");
+        assert_eq!(designs.window.window_minutes, 10080);
+        let routines = u
+            .extra_rate_windows
+            .iter()
+            .find(|w| w.id == "claude-routines")
+            .expect("routines window");
+        assert_eq!(routines.title, "Daily Routines");
+        assert_eq!(routines.window.window_minutes, 10080);
+    }
+
+    #[test]
+    fn usage_block_without_extra_rate_windows_defaults_to_empty() {
+        // Older v0.20 fixtures must keep working: missing field decodes
+        // as an empty Vec, not a hard error.
+        let rs = parse_usage(USAGE_CLAUDE_CLI).unwrap();
+        let u = rs[0].usage.as_ref().unwrap();
+        assert!(u.extra_rate_windows.is_empty());
     }
 
     #[test]
@@ -439,15 +498,24 @@ mod tests {
     fn config_dump_parses_real_captured_output() {
         let c = parse_config_dump(CONFIG_DUMP).unwrap();
         assert_eq!(c.version, 1);
-        // v0.20 ships 25 provider slots in the default config. Pin the
-        // count so a future codexbar release that renames/adds/drops one
-        // surfaces loudly rather than drifting silently.
-        assert_eq!(c.providers.len(), 25);
         let ids = c.ids();
+        // codexbar's first slot is always the Codex provider — it's the
+        // namesake. If that ever changes upstream we want to know.
         assert_eq!(ids.first().map(|s| s.as_str()), Some("codex"));
-        assert!(ids.contains(&"claude".to_string()));
-        assert!(ids.contains(&"gemini".to_string()));
-        assert!(ids.contains(&"vertexai".to_string()));
+        // Anchor on a stable subset of IDs the TUI knows how to render.
+        // Pinning the exact count would re-break every codexbar release
+        // that adds a provider (v0.21 added abacus, v0.23 added mistral).
+        for must_have in ["codex", "claude", "gemini", "vertexai"] {
+            assert!(
+                ids.iter().any(|id| id == must_have),
+                "config dump missing required provider id: {must_have}"
+            );
+        }
+        assert!(
+            ids.len() >= 25,
+            "config dump shrank below the v0.20 baseline: {} providers",
+            ids.len()
+        );
         // Field-order agnosticism: the v0.20 Linux build emits
         // {"version":1,"providers":[{"enabled":true,"id":"codex"},...]}
         // with enabled before id; older/macOS builds emit id before enabled.
