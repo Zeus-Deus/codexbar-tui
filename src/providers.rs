@@ -12,6 +12,13 @@
 //! of these providers, REMOVE that ID from `LINUX_WEB_ONLY`**. The TUI will
 //! then pick it up automatically via the next `codexbar config dump` read.
 //!
+//! Re-audited against codexbar v0.77.0 (2026-10): `minimax` was dropped
+//! from this list — upstream now ships an `api` source for it that works on
+//! Linux (`codexbar usage --provider minimax --source api` returns quota
+//! data against the API key in `~/.codexbar/config.json`). Keeping it here
+//! hid a fully-working provider from the TUI. The remaining IDs were
+//! re-probed the same way and still have no non-web source.
+//!
 //! Not in this list, and therefore expected to work on Linux:
 //! `claude`, `codex` (CLI auth), `gemini`, `zai`, `warp`, `openrouter`,
 //! `copilot`, `kimik2`, `kilo`, `kiro`, `vertexai`, `jetbrains`,
@@ -28,7 +35,6 @@ pub const LINUX_WEB_ONLY: &[&str] = &[
     "perplexity",
     "factory",
     "ollama",
-    "minimax",
     // v0.23 additions (PR steipete/CodexBar#607). Both ship only a web
     // fetch strategy with macOS-gated cookie cache branches.
     "mistral",
@@ -82,8 +88,13 @@ pub fn preferred_source(id: &str) -> &'static str {
         // ~/.codexbar/config.json (Copilot — Linux-unreachable for now
         // but we surface codexbar's real error), Gemini's oauth-creds
         // extraction, and Kilo's api-first-cli-fallback mode.
+        // `minimax` is here since codexbar v0.77: it dropped the macOS-only
+        // web path in favour of a quota API keyed off the `apiKey` entry in
+        // ~/.codexbar/config.json. `codexbar usage --provider minimax
+        // --source api` works on Linux; `--source cli` / `--source oauth`
+        // are rejected with "Source 'cli' is not supported for minimax.".
         "gemini" | "copilot" | "zai" | "warp" | "openrouter" | "kimik2" | "kimi"
-        | "synthetic" | "alibaba" | "kilo" | "augment" => "api",
+        | "synthetic" | "alibaba" | "kilo" | "augment" | "minimax" => "api",
 
         // Unknown: let codexbar explain.
         _ => "cli",

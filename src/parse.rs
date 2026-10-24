@@ -67,8 +67,12 @@ pub struct UsageBlock {
     /// builds and on providers that don't expose extras.
     #[serde(default, rename = "extraRateWindows")]
     pub extra_rate_windows: Vec<NamedRateWindow>,
-    #[serde(rename = "updatedAt")]
-    pub updated_at: DateTime<Utc>,
+    /// Timestamp of the payload. Present in every v0.20-v0.77 record we
+    /// have seen, but kept optional so a provider that omits it degrades
+    /// to "no upstream timestamp" instead of failing the whole record
+    /// with "missing field `updatedAt`".
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 /// A rate-limit window the provider names explicitly rather than slotting
@@ -124,10 +128,23 @@ pub struct ErrorBlock {
 pub struct CostRecord {
     pub provider: String,
     pub source: String,
-    #[serde(rename = "updatedAt")]
-    pub updated_at: DateTime<Utc>,
+    /// Timestamp of the cost report. Optional because codexbar v0.77
+    /// answers `cost` for most providers with an *error* record instead
+    /// of a report, and that record carries no timestamp:
+    /// `{"error":{"code":1,"kind":"args","message":"Error: cost is only
+    /// supported for Antigravity, Claude, Codex, Muse Code, Pi."},
+    /// "source":"cli","provider":"cli"}`. Requiring the field turned
+    /// every one of those into a hard "missing field `updatedAt`" parse
+    /// failure instead of "this provider simply has no cost data".
+    #[serde(default, rename = "updatedAt")]
+    pub updated_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub daily: Vec<DailyCost>,
+    /// Upstream error block, present when codexbar refused the cost
+    /// request. `Some` here means "no cost data for this provider", not
+    /// a malformed payload.
+    #[serde(default)]
+    pub error: Option<ErrorBlock>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

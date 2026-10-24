@@ -221,9 +221,22 @@ fn run_once(provider: &ProviderId, command: Command, ev_tx: &Sender<PollEvent>) 
                 // cost emits one record per provider at top-level; we
                 // requested --provider <id>, so take the first.
                 let record = recs.drain(..).next();
-                PollEvent::Cost {
-                    provider: provider.clone(),
-                    record,
+                // codexbar v0.77 answers `cost` for most providers with an
+                // error record instead of a report ("cost is only supported
+                // for Antigravity, Claude, Codex, Muse Code, Pi."). That's
+                // "no cost data", not a failure — surface upstream's own
+                // wording in the status line instead of a serde complaint.
+                if let Some(err) = record.as_ref().and_then(|r| r.error.as_ref()) {
+                    PollEvent::Error {
+                        provider: provider.clone(),
+                        command,
+                        message: err.message.clone(),
+                    }
+                } else {
+                    PollEvent::Cost {
+                        provider: provider.clone(),
+                        record,
+                    }
                 }
             }
             Err(e) => PollEvent::Error {

@@ -248,7 +248,7 @@ pub fn build_snapshot(
         .or_else(|| usage_records.first());
 
     if let Some(r) = record {
-        snap.upstream_at = r.usage.as_ref().map(|u| u.updated_at);
+        snap.upstream_at = r.usage.as_ref().and_then(|u| u.updated_at);
         match (&r.usage, &r.error) {
             (Some(u), _) => {
                 snap.health = ProviderHealth::Ok;
@@ -533,7 +533,8 @@ mod tests {
         let record = CostRecord {
             provider: "claude".into(),
             source: "local".into(),
-            updated_at: now_utc(),
+            updated_at: Some(now_utc()),
+            error: None,
             daily: vec![
                 DailyCost {
                     date: "2026-04-17".parse().unwrap(),
